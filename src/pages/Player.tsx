@@ -84,6 +84,13 @@ const CARD_FADE_MS = 600;
 // it we swap anyway so a slow asset can't stall the playlist.
 const ASSET_GATE_MS = 1200;
 
+// Breathing room shared by every card that renders DATA rather than full-bleed
+// media. Viewport-relative on purpose: a fixed pixel ring (these ranged from
+// p-10 to p-24) reads as generous on a laptop and cramped on a 55" TV, and it
+// was why some cards looked airy and others ran to the edge. How "big" a card
+// feels is then controlled by its own max-width and type scale, not by this.
+const CARD_SAFE_AREA = { padding: '6vh 6vw' } as const;
+
 // Types this bundle knows how to draw. A media doc whose type is missing here
 // (e.g. a card created in the admin while this TV still runs an older bundle)
 // renders a placeholder instead of an empty black screen.
@@ -580,7 +587,7 @@ const MediaCarousel = React.memo(({ payload, carouselIndex }: { payload: any, ca
 ));
 
 const MediaWebsiteEmbed = React.memo(({ payload, title }: { payload: any, title: string }) => (
-  <div className="w-full h-full bg-[#050505] flex items-center justify-center p-24">
+  <div className="w-full h-full bg-[#050505] flex items-center justify-center" style={CARD_SAFE_AREA}>
     <div className="w-full max-w-[80vw] space-y-12">
       <div className="flex justify-between items-end border-b border-white/10 pb-6">
         <div className="space-y-3">
@@ -1620,7 +1627,7 @@ export function Player() {
 
             {currentMedia.type === 'WEBSITE_EMBED' && <MediaWebsiteEmbed payload={currentMedia.payload} title={currentMedia.title} />}
             {currentMedia.type === 'NEWS_CLIPPING' && (
-              <div className="w-full h-full bg-[#050505] flex items-center justify-center p-24 relative overflow-hidden">
+              <div className="w-full h-full bg-[#050505] flex items-center justify-center relative overflow-hidden" style={CARD_SAFE_AREA}>
                 {/* Background Decoration */}
                 <div className="absolute top-0 right-0 w-[60vw] h-[60vw] bg-adsplay/5 blur-[120px] rounded-full -translate-y-1/2 translate-x-1/4" />
                 <div className="absolute bottom-0 left-0 w-[40vw] h-[40vw] bg-purple-500/5 blur-[100px] rounded-full translate-y-1/2 -translate-x-1/4" />
@@ -1757,7 +1764,7 @@ export function Player() {
               </div>
             )}
             {currentMedia.type === 'MONTHLY_GOAL' && (
-              <div className="w-full h-full bg-zinc-950 flex items-center justify-center p-20 relative">
+              <div className="w-full h-full bg-zinc-950 flex items-center justify-center relative" style={CARD_SAFE_AREA}>
                 {(() => {
                   const months = [...(currentMedia.payload.months || [])].sort((a, b) => a.month - b.month);
                   const current = months.length > 0 ? months[months.length - 1] : { month: 1, target: 1, current: 0 };
@@ -2078,7 +2085,7 @@ export function Player() {
               };
 
               return (
-                <div className="w-full h-full bg-[#050505] flex flex-col p-14 gap-10 relative overflow-hidden">
+                <div className="w-full h-full bg-[#050505] flex flex-col gap-10 relative overflow-hidden" style={CARD_SAFE_AREA}>
                   <div className="absolute top-0 right-0 w-[70vw] h-[70vw] bg-adsplay/10 blur-[140px] rounded-full -translate-y-1/2 translate-x-1/4" />
                   <div className="absolute bottom-0 left-0 w-[50vw] h-[50vw] bg-purple-500/10 blur-[120px] rounded-full translate-y-1/2 -translate-x-1/4" />
 
@@ -2135,7 +2142,7 @@ export function Player() {
             })()}
 
             {currentMedia.type === 'WEATHER' && currentMedia.payload && (
-              <div className={`w-full h-full flex items-center justify-center p-24 relative overflow-hidden transition-all duration-1000 ${
+              <div style={CARD_SAFE_AREA} className={`w-full h-full flex items-center justify-center relative overflow-hidden transition-all duration-1000 ${
                 (currentMedia.payload.condition || '').toLowerCase().includes('tempestade') || (currentMedia.payload.condition || '').toLowerCase().includes('raio') ? 'bg-[#050505]' :
                 (currentMedia.payload.condition || '').toLowerCase().includes('chuva') ? 'bg-[#0a1a2f]' :
                 (currentMedia.payload.condition || '').toLowerCase().includes('nublado') ? 'bg-[#1a1a1a]' :
@@ -2255,7 +2262,13 @@ export function Player() {
               const target = Number(currentMedia.payload.target) || 1;
               const current = Number(currentMedia.payload.current) || 0;
               const remaining = Math.max(0, target - current);
-              const percentage = Math.min(100, Math.round((current / target) * 100));
+              // Uncapped: past the goal the bar rescales so the goal line moves
+              // INSIDE the fill, and the stretch beyond it reads as the overshoot.
+              const percentage = Math.round((current / target) * 100);
+              const surplus = Math.max(0, current - target);
+              const barMax = Math.max(100, percentage);
+              const fillPct = (percentage / barMax) * 100;
+              const goalMarkPct = (100 / barMax) * 100;
               const label = currentMedia.payload.label || 'vendas';
               const month = currentMedia.payload.month || '';
               const teamName = currentMedia.payload.teamName || '';
@@ -2263,7 +2276,7 @@ export function Player() {
               const fmtBR = (n: number) => `R$ ${n.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
               return (
-                <div className="w-full h-full bg-[#060606] flex flex-col items-center justify-center relative overflow-hidden">
+                <div className="w-full h-full bg-[#060606] flex flex-col items-center justify-center relative overflow-hidden" style={CARD_SAFE_AREA}>
                   {/* Atmospheric glow */}
                   <div className="absolute inset-0 pointer-events-none">
                     <motion.div
@@ -2375,7 +2388,7 @@ export function Player() {
                           transition={{ duration: 1.5, repeat: !isGoalHit ? Infinity : 0 }}
                           className={`text-base font-black uppercase tracking-widest ${isGoalHit ? 'text-emerald-400' : 'text-adsplay'}`}
                         >
-                          {percentage}% atingido
+                          {percentage}% atingido{surplus > 0 ? ` · +${percentage - 100}% acima` : ''}
                         </motion.p>
                         <p className="text-xs font-black text-zinc-700 uppercase tracking-widest">{target} {label}</p>
                       </div>
@@ -2383,9 +2396,9 @@ export function Player() {
                       <div className="relative h-10 w-full bg-zinc-900 rounded-full border border-white/5 overflow-hidden">
                         <motion.div
                           initial={{ width: 0 }}
-                          animate={{ width: `${percentage}%` }}
+                          animate={{ width: `${fillPct}%` }}
                           transition={{ duration: 2.5, ease: "easeOut" }}
-                          className={`h-full rounded-full relative overflow-hidden ${isGoalHit ? 'bg-gradient-to-r from-emerald-500 to-emerald-400' : 'bg-gradient-to-r from-adsplay via-violet-500 to-fuchsia-500'}`}
+                          className={`h-full rounded-full relative overflow-hidden ${isGoalHit ? 'bg-gradient-to-r from-emerald-500 via-emerald-400 to-amber-300' : 'bg-gradient-to-r from-adsplay via-violet-500 to-fuchsia-500'}`}
                         >
                           <motion.div
                             animate={{ x: ['-100%', '200%'] }}
@@ -2393,12 +2406,15 @@ export function Player() {
                             className="absolute inset-0 bg-gradient-to-r from-transparent via-white/25 to-transparent skew-x-12"
                           />
                         </motion.div>
+                        {percentage > 100 && (
+                          <div className="absolute inset-y-0 w-[3px] bg-black/70" style={{ left: `${goalMarkPct}%` }} />
+                        )}
                       </div>
 
                       <div className="relative" style={{ height: '72px' }}>
                         <motion.div
                           initial={{ left: '1%' }}
-                          animate={{ left: `${Math.max(1, Math.min(93, percentage - 2))}%` }}
+                          animate={{ left: `${Math.max(1, Math.min(93, fillPct - 2))}%` }}
                           transition={{ duration: 2.5, ease: "easeOut" }}
                           className="absolute top-1 transform -translate-x-1/2"
                         >
@@ -2485,7 +2501,7 @@ export function Player() {
               const rest = sales.slice(1, 5);
 
               return (
-                <div className="w-full h-full bg-[#060606] flex flex-col relative overflow-hidden p-12 gap-8">
+                <div className="w-full h-full bg-[#060606] flex flex-col relative overflow-hidden gap-8" style={CARD_SAFE_AREA}>
                   {/* Atmospheric glow */}
                   <div className="absolute inset-0 pointer-events-none">
                     <motion.div
@@ -2591,7 +2607,7 @@ export function Player() {
               const next = wcBrazil.nextMatch;
               const loading = wcMatches === null;
               return (
-                <div className="w-full h-full bg-gradient-to-b from-white to-zinc-100 flex flex-col p-16 gap-10 relative overflow-hidden">
+                <div className="w-full h-full bg-gradient-to-b from-white to-zinc-100 flex flex-col gap-10 relative overflow-hidden" style={CARD_SAFE_AREA}>
                   <div className="absolute top-0 left-0 right-0 h-3 bg-gradient-to-r from-emerald-500 via-yellow-400 to-emerald-500" />
                   <div className="flex items-center gap-6 relative z-10">
                     <TeamFlag code="br" imgClass="w-24 h-16" emojiClass="text-8xl" />
@@ -2681,7 +2697,7 @@ export function Player() {
                 return <span className="px-4 py-1.5 bg-zinc-900 text-white rounded-full text-sm font-black uppercase tracking-widest">Agendado</span>;
               };
               return (
-                <div className="w-full h-full bg-gradient-to-b from-white to-zinc-100 flex flex-col p-16 gap-8 relative overflow-hidden">
+                <div className="w-full h-full bg-gradient-to-b from-white to-zinc-100 flex flex-col gap-8 relative overflow-hidden" style={CARD_SAFE_AREA}>
                   <div className="absolute top-0 left-0 right-0 h-3 bg-adsplay" />
                   <div className="flex items-center justify-between relative z-10">
                     <div className="flex items-center gap-5">
@@ -2819,7 +2835,7 @@ export function Player() {
               );
 
               return (
-                <div className="w-full h-full bg-gradient-to-b from-white to-zinc-100 flex flex-col p-10 gap-5 relative overflow-hidden">
+                <div className="w-full h-full bg-gradient-to-b from-white to-zinc-100 flex flex-col gap-5 relative overflow-hidden" style={CARD_SAFE_AREA}>
                   <div className="absolute top-0 left-0 right-0 h-3 bg-gradient-to-r from-emerald-500 via-yellow-400 to-emerald-500" />
                   <div className="text-center relative z-10">
                     <h2 className="text-6xl font-black text-zinc-900 tracking-tighter leading-none">Caminho até a Final</h2>
@@ -2883,7 +2899,7 @@ export function Player() {
                 .slice().sort((a: any, b: any) => (Number(b.titles) || 0) - (Number(a.titles) || 0));
               const maxT = ranking.reduce((m: number, r: any) => Math.max(m, Number(r.titles) || 0), 0);
               return (
-                <div className="w-full h-full bg-gradient-to-b from-white to-zinc-100 flex flex-col items-center justify-center relative overflow-hidden" style={{ padding: '7vh 8vw' }}>
+                <div className="w-full h-full bg-gradient-to-b from-white to-zinc-100 flex flex-col items-center justify-center relative overflow-hidden" style={CARD_SAFE_AREA}>
                   <div className="absolute top-0 left-0 right-0 h-3 bg-gradient-to-r from-yellow-400 via-amber-500 to-yellow-400" />
                   <div className="w-full max-w-4xl flex flex-col gap-6 relative z-10 min-h-0">
                     <div className="flex items-center gap-4 justify-center text-center">
