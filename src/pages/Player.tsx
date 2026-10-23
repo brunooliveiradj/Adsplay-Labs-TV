@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { motion, AnimatePresence, animate, useMotionValue, useTransform } from 'framer-motion';
 import { 
   PieChart, 
@@ -18,9 +18,8 @@ import {
   Wifi, 
   WifiOff, 
   Loader2, 
-  Play, 
+  Play,
   AlertCircle,
-  QrCode,
   ArrowLeft,
   Monitor,
   Maximize,
@@ -42,30 +41,94 @@ import {
   CloudLightning,
   Snowflake,
   CloudFog,
-  Globe
+  Globe,
+  Trophy
 } from 'lucide-react';
-import { QRCodeSVG } from 'qrcode.react';
-import { useSearchParams, Link } from 'react-router-dom';
+import { useSearchParams, useParams, Link } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
+import { CardBoundary, CardPlaceholder } from '../components/CardBoundary';
 import { db, handleFirestoreError, OperationType } from '../firebase';
 import { GoogleGenAI } from "@google/genai";
-import { 
-  collection, 
-  doc, 
-  onSnapshot, 
-  updateDoc, 
-  serverTimestamp, 
-  query, 
-  where, 
+import { deriveBrazil, deriveToday, deriveBracket, wcResultLetter, flagUrl, fetchWcPendingUpdates, matchupKey, knockoutOrder, isLiveByClock, brasiliaTodayISO, fmtBrDate, WC_LIVE_REFRESH_MS, WCMatch } from '../lib/worldcup';
+import {
+  collection,
+  doc,
+  onSnapshot,
+  updateDoc,
+  serverTimestamp,
+  query,
+  where,
   getDocs,
-  getDoc
+  getDoc,
+  orderBy,
+  limit
 } from 'firebase/firestore';
 
 interface Media {
   id: string;
   title: string;
-  type: 'IMAGE_HERO' | 'VIDEO_FILE' | 'YOUTUBE' | 'DASHBOARD' | 'INSTAGRAM' | 'MONTHLY_GOAL' | 'CAROUSEL' | 'NEWS_CLIPPING' | 'NORTH_STAR' | 'WEATHER' | 'WEBSITE_EMBED';
+  type: 'IMAGE_HERO' | 'VIDEO_FILE' | 'YOUTUBE' | 'DASHBOARD' | 'INSTAGRAM' | 'MONTHLY_GOAL' | 'CAROUSEL' | 'NEWS_CLIPPING' | 'NORTH_STAR' | 'WEATHER' | 'WEBSITE_EMBED' | 'FINAL_SPRINT' | 'SMART_SALES' | 'WC_BRAZIL' | 'WC_TODAY' | 'WC_BRACKET' | 'WC_RANKING';
   payload: any;
+}
+
+// ---------------------------------------------------------------------------
+// Card rotation tuning
+// ---------------------------------------------------------------------------
+
+// Crossfade length. The outgoing card stays fully opaque underneath while the
+// incoming one fades in on top, so the screen never dips toward black.
+const CARD_FADE_MS = 600;
+
+// How long a rotation may be held back waiting for the next card's images to
+// decode. Under this cap the CURRENT card stays on screen (never black); past
+// it we swap anyway so a slow asset can't stall the playlist.
+const ASSET_GATE_MS = 1200;
+
+// Types this bundle knows how to draw. A media doc whose type is missing here
+// (e.g. a card created in the admin while this TV still runs an older bundle)
+// renders a placeholder instead of an empty black screen.
+const KNOWN_MEDIA_TYPES = new Set([
+  'IMAGE_HERO', 'VIDEO_FILE', 'YOUTUBE', 'DASHBOARD', 'INSTAGRAM', 'CAROUSEL',
+  'NEWS_CLIPPING', 'WEBSITE_EMBED', 'WEATHER', 'MONTHLY_GOAL', 'NORTH_STAR',
+  'FINAL_SPRINT', 'SMART_SALES', 'WC_BRAZIL', 'WC_TODAY', 'WC_BRACKET', 'WC_RANKING',
+]);
+
+// Types whose render dereferences payload fields directly — without a payload
+// they would either throw or paint nothing at all.
+const PAYLOAD_REQUIRED_TYPES = new Set([
+  'IMAGE_HERO', 'VIDEO_FILE', 'YOUTUBE', 'DASHBOARD', 'INSTAGRAM', 'CAROUSEL',
+  'WEBSITE_EMBED', 'WEATHER',
+]);
+
+const canRenderMedia = (m: Media | null) => {
+  if (!m || !KNOWN_MEDIA_TYPES.has(m.type)) return false;
+  if (PAYLOAD_REQUIRED_TYPES.has(m.type) && !m.payload) return false;
+  return true;
+};
+
+// Images worth decoding before a card goes on screen.
+const heroAssetsOf = (m: Media | null): string[] => {
+  if (!m?.payload) return [];
+  const p = m.payload;
+  if (m.type === 'IMAGE_HERO') return p.url ? [p.url] : [];
+  if (m.type === 'WEBSITE_EMBED') return p.screenshotUrl ? [p.screenshotUrl] : [];
+  if (m.type === 'CAROUSEL') return (p.images || []).slice(0, 2).map((i: any) => i?.url).filter(Boolean);
+  if (m.type === 'NEWS_CLIPPING') return (p.images || []).slice(0, 2).map((i: any) => i?.url).filter(Boolean);
+  return [];
+};
+
+interface Sale {
+  id: string;
+  squad?: string;
+  status?: string;
+  pi?: string;
+  investimento?: string;
+  investimentoValor?: number;
+  periodo?: string;
+  sdr?: string;
+  executivo?: string;
+  cs?: string;
+  soldAt?: number;
 }
 
 interface PlaylistItem {
@@ -105,6 +168,55 @@ const safeStorage = {
     }
   }
 };
+
+// Country flag: prefers a real flag image (from ISO code) since emoji flags
+// often don't render on Samsung/Tizen TV browsers. Falls back to emoji, then 🏳️.
+const TeamFlag = ({ code, emoji, imgClass, emojiClass, size }: { code?: string; emoji?: string; imgClass?: string; emojiClass?: string; size?: string }) => {
+  const [err, setErr] = useState(false);
+  const url = flagUrl(code, size);
+  if (url && !err) {
+    return (
+      <img
+        src={url}
+        alt=""
+        decoding="async"
+        referrerPolicy="no-referrer"
+        onError={() => setErr(true)}
+        className={`inline-block object-cover rounded-[3px] shadow-sm ${imgClass || ''}`}
+      />
+    );
+  }
+  return <span className={emojiClass}>{emoji || '🏳️'}</span>;
+};
+
+// North Star: % variation vs. the previous saved value. prev==null means the
+// metric was never updated before (no badge). prev==0 → % is undefined, so we
+// show the absolute delta instead (e.g. "+5").
+const NSDelta = React.memo(({ prev, cur, size = 'text-base' }: { prev?: number | null; cur: number; size?: string }) => {
+  if (prev == null) return null;
+  const p = Number(prev) || 0;
+  let dir: 1 | -1 | 0;
+  let label: string;
+  if (p === 0) {
+    dir = cur > 0 ? 1 : 0;
+    label = cur > 0 ? `+${cur}` : '0%';
+  } else {
+    const pct = Math.round(((cur - p) / p) * 100);
+    dir = pct > 0 ? 1 : pct < 0 ? -1 : 0;
+    label = `${pct > 0 ? '+' : ''}${pct}%`;
+  }
+  const cls = dir > 0
+    ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/20'
+    : dir < 0
+      ? 'bg-rose-500/15 text-rose-400 border-rose-500/20'
+      : 'bg-white/5 text-zinc-500 border-white/10';
+  const arrow = dir > 0 ? '▲' : dir < 0 ? '▼' : '•';
+  return (
+    <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full border font-black ${size} ${cls}`}>
+      <span className="text-[0.7em]">{arrow}</span>{label}
+    </span>
+  );
+});
 
 // Helper Components for Animations
 const Counter = React.memo(({ value, className }: { value: number, className?: string }) => {
@@ -515,10 +627,16 @@ export function Player() {
   const { user } = useAuth();
   const [searchParams] = useSearchParams();
   const urlDeviceId = searchParams.get('id');
+
+  // Playlist URL (/p/:playlistId): pin this player to one playlist and loop it
+  // forever, ignoring the schedule. Used to embed a single playlist somewhere
+  // else without disturbing the TVs' regular programming.
+  const { playlistId: pinnedPlaylistId } = useParams();
+  const [pinnedMissing, setPinnedMissing] = useState(false);
   
-  const [isPaired, setIsPaired] = useState(false);
-  const [pairCode, setPairCode] = useState('');
-  const [deviceId, setDeviceId] = useState<string | null>(urlDeviceId || safeStorage.get('labs365_device_id'));
+  // No pairing: the player always plays the current playlist. An explicit
+  // ?id=<deviceId> is optional and used only for monitoring (name + last_ping).
+  const deviceId = urlDeviceId;
   const [deviceName, setDeviceName] = useState('');
   const [status, setStatus] = useState<'IDLE' | 'PLAYING' | 'ERROR'>('IDLE');
   const [playlist, setPlaylist] = useState<Playlist | null>(null);
@@ -618,10 +736,15 @@ export function Player() {
       clearTimeout(timer);
     };
   }, [promptDismissed]);
-  const [error, setError] = useState<string | null>(null);
   const [isFetchingNews, setIsFetchingNews] = useState(false);
   const [isFetchingWeather, setIsFetchingWeather] = useState(false);
   const [newsItems, setNewsItems] = useState<any[]>([]);
+  const [wcMatches, setWcMatches] = useState<WCMatch[] | null>(null);
+  const wcMatchesRef = useRef<WCMatch[] | null>(null);
+  const wcUnsubRef = useRef<null | (() => void)>(null);
+  const wcPrevScoresRef = useRef<Record<string, { h: number; a: number }>>({});
+  const [wcGoal, setWcGoal] = useState<{ id: string; side: 'home' | 'away' } | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
 
   const shouldUpdateNews = (lastUpdateMs?: number) => {
     if (!lastUpdateMs) return true;
@@ -806,6 +929,29 @@ export function Player() {
     };
   }, []);
 
+  // Remote refresh: the admin bumps config/player.reloadAt to force every
+  // connected TV to reload (picking up a new deploy). The first snapshot is
+  // the baseline; only a NEWER value triggers a reload. A cache-busting query
+  // param is used so even aggressive TV browsers fetch a fresh document.
+  useEffect(() => {
+    let baseline: number | null = null;
+    const unsub = onSnapshot(doc(db, 'config', 'player'), (snap) => {
+      const v = snap.exists() ? (Number(snap.data().reloadAt) || 0) : 0;
+      if (baseline === null) { baseline = v; return; }
+      if (v > baseline) {
+        baseline = v;
+        try {
+          const url = new URL(window.location.href);
+          url.searchParams.set('_r', String(v));
+          window.location.replace(url.toString());
+        } catch (e) {
+          window.location.reload();
+        }
+      }
+    }, (err) => console.error('config/player subscription error:', err));
+    return () => unsub();
+  }, []);
+
   // 1.1 Handle Wake Lock (Prevent screen from turning off)
   useEffect(() => {
     let wakeLock: any = null;
@@ -870,37 +1016,26 @@ export function Player() {
     };
   }, [status]);
 
-  // 2. Pairing Logic & Device Sync
+  // 2. Device monitoring (optional — only when an explicit ?id= is provided).
+  // No pairing: this just reflects the device name and pings last_ping so the
+  // admin "Dispositivos" page can show which TVs are online.
   useEffect(() => {
     if (!deviceId) {
-      // Generate a new temporary pair code
-      const code = Math.floor(1000 + Math.random() * 9000).toString();
-      setPairCode(code);
+      setDeviceName('Player');
       return;
     }
 
-    // Listen to device document
     const unsubscribe = onSnapshot(doc(db, 'devices', deviceId), (docSnap) => {
       if (docSnap.exists()) {
-        const data = docSnap.data();
-        setIsPaired(data.is_paired);
-        setDeviceName(data.name);
-      } else if (!urlDeviceId) {
-        // Device removed from DB and not a forced URL preview
-        safeStorage.remove('labs365_device_id');
-        setDeviceId(null);
-        setIsPaired(false);
+        setDeviceName(docSnap.data().name || 'Player');
       }
     }, (err) => {
-      console.error('Firestore error:', err);
-      if (urlDeviceId) {
-        setError('Dispositivo não encontrado ou sem permissão.');
-      }
+      console.error('Device read error:', err);
     });
 
     // Ping interval (every 30 seconds to save writes)
     const pingInterval = setInterval(() => {
-      if (deviceId && !urlDeviceId && isOnline) {
+      if (isOnline) {
         updateDoc(doc(db, 'devices', deviceId), {
           last_ping: serverTimestamp()
         }).catch(err => console.error('Ping error:', err));
@@ -911,60 +1046,99 @@ export function Player() {
       unsubscribe();
       clearInterval(pingInterval);
     };
-  }, [deviceId, urlDeviceId, isOnline]);
+  }, [deviceId, isOnline]);
 
-  // 3. Polling for Pairing (if not paired)
+  // 3. Fetch the current playlist. A pinned playlist (/p/:playlistId) wins over
+  // everything; otherwise: playlist scheduled for today, falling back to the
+  // most recently created one so the TV never sits idle when content exists.
   useEffect(() => {
-    if (isPaired || deviceId) return;
-
-    const interval = setInterval(async () => {
-      try {
-        const q = query(collection(db, 'devices'), where('pair_code', '==', pairCode), where('is_paired', '==', true));
-        const querySnapshot = await getDocs(q);
-        if (!querySnapshot.empty) {
-          const doc = querySnapshot.docs[0];
-          const id = doc.id;
-          setDeviceId(id);
-          safeStorage.set('labs365_device_id', id);
-        }
-      } catch (err) {
-        console.error('Pairing poll error:', err);
-      }
-    }, 5000);
-
-    return () => clearInterval(interval);
-  }, [isPaired, deviceId, pairCode]);
-
-  // 4. Fetch Schedule & Playlist
-  useEffect(() => {
-    // Load schedule if paired OR if no device ID is provided (Public Mode)
-    if (!isPaired && deviceId) return;
-
     const today = new Date().toISOString().split('T')[0];
-    
-    // Listen to schedule for today
-    const unsubscribe = onSnapshot(doc(db, 'schedule', today), async (docSnap) => {
-      if (docSnap.exists()) {
-        const playlistId = docSnap.data().playlistId;
-        if (playlistId) {
-          const plSnap = await getDoc(doc(db, 'playlists', playlistId));
-          if (plSnap.exists()) {
-            setPlaylist(Object.assign({ id: plSnap.id }, plSnap.data()) as Playlist);
-            setCurrentIndex(0);
-            setStatus('PLAYING');
-            return;
-          }
-        }
+    let playlistUnsub: (() => void) | null = null;
+    let lastPlaylistId: string | null = null;
+
+    const subscribeToPlaylist = (playlistId: string, pinned = false) => {
+      if (playlistUnsub) {
+        playlistUnsub();
+        playlistUnsub = null;
       }
-      // No schedule or playlist found
+      playlistUnsub = onSnapshot(doc(db, 'playlists', playlistId), (plSnap) => {
+        if (plSnap.exists()) {
+          if (pinned) setPinnedMissing(false);
+          const newPlaylist = Object.assign({ id: plSnap.id }, plSnap.data()) as Playlist;
+          const isNewPlaylist = lastPlaylistId !== newPlaylist.id;
+          lastPlaylistId = newPlaylist.id;
+          if (isNewPlaylist) {
+            setCurrentIndex(0);
+          } else {
+            // Same playlist, items changed: keep position but clamp if needed
+            setCurrentIndex(prev => Math.min(prev, Math.max(0, newPlaylist.items.length - 1)));
+          }
+          setPlaylist(newPlaylist);
+          setStatus('PLAYING');
+        } else {
+          if (pinned) setPinnedMissing(true);
+          lastPlaylistId = null;
+          setPlaylist(null);
+          setStatus('IDLE');
+        }
+      }, (err) => {
+        handleFirestoreError(err, OperationType.GET, `playlists/${playlistId}`);
+      });
+    };
+
+    const clearPlaylist = () => {
+      if (playlistUnsub) {
+        playlistUnsub();
+        playlistUnsub = null;
+      }
+      lastPlaylistId = null;
       setPlaylist(null);
       setStatus('IDLE');
+    };
+
+    const loadFallback = async () => {
+      // Nothing scheduled for today: play the most recently created playlist.
+      try {
+        const snap = await getDocs(collection(db, 'playlists'));
+        if (!snap.empty) {
+          const docs = snap.docs.slice().sort(
+            (a, b) => (b.data().createdAt?.toMillis?.() || 0) - (a.data().createdAt?.toMillis?.() || 0)
+          );
+          subscribeToPlaylist(docs[0].id);
+          return;
+        }
+      } catch (err) {
+        console.error('Fallback playlist error:', err);
+      }
+      clearPlaylist();
+    };
+
+    // Pinned playlist: no schedule listener, no fallback. If the id is wrong we
+    // say so instead of silently playing something else.
+    if (pinnedPlaylistId) {
+      setPinnedMissing(false);
+      subscribeToPlaylist(pinnedPlaylistId, true);
+      return () => {
+        if (playlistUnsub) playlistUnsub();
+      };
+    }
+
+    const scheduleUnsub = onSnapshot(doc(db, 'schedule', today), (docSnap) => {
+      const playlistId = docSnap.exists() ? docSnap.data().playlistId : null;
+      if (playlistId) {
+        subscribeToPlaylist(playlistId);
+      } else {
+        loadFallback();
+      }
     }, (err) => {
       handleFirestoreError(err, OperationType.GET, `schedule/${today}`);
     });
 
-    return () => unsubscribe();
-  }, [isPaired]);
+    return () => {
+      scheduleUnsub();
+      if (playlistUnsub) playlistUnsub();
+    };
+  }, [pinnedPlaylistId]);
 
   // 5. Playback Loop
   const handleNext = React.useCallback(() => {
@@ -972,9 +1146,20 @@ export function Player() {
     setCurrentIndex((prev) => (prev + 1) % playlist.items.length);
   }, [playlist]);
 
-  // 6. Media Resolver (Real-time media fetch)
-  const [currentMedia, setCurrentMedia] = useState<Media | null>(null);
+  // 6. Media Resolver — atomic card swap over a warm media cache.
+  //
+  // The card on screen is a "slot": index + media travel together, so the
+  // AnimatePresence key changes exactly ONCE per rotation. Previously the key
+  // came from currentIndex while the media doc arrived a moment later, so every
+  // transition remounted the outgoing card first and then mounted the incoming
+  // one — two (sometimes three) full-screen trees alive at once, which is what
+  // made Tizen drop frames and flash black.
+  const [slot, setSlot] = useState<{ index: number; media: Media; seq: number } | null>(null);
+  const currentMedia: Media | null = slot?.media ?? null;
   const [carouselIndex, setCarouselIndex] = useState(0);
+  const [sales, setSales] = useState<Sale[]>([]);
+  const [newSaleId, setNewSaleId] = useState<string | null>(null);
+  const knownSaleIdsRef = useRef<Set<string> | null>(null);
 
   useEffect(() => {
     if (currentMedia?.type === 'NEWS_CLIPPING') {
@@ -985,6 +1170,135 @@ export function Player() {
       setNewsItems([]);
     }
   }, [currentMedia?.id]);
+
+  // World Cup: subscribe to the shared wc_matches collection (source of truth).
+  // Subscribe ONCE (the first time a WC card appears) and keep the listener +
+  // data warm for the rest of the session — so WC cards re-render instantly on
+  // rotation (like the payload-only cards), with no "Carregando" cold start.
+  const isWC = currentMedia?.type === 'WC_BRAZIL' || currentMedia?.type === 'WC_TODAY' || currentMedia?.type === 'WC_BRACKET';
+  useEffect(() => {
+    if (!isWC || wcUnsubRef.current) return; // already subscribed → stay warm
+    wcUnsubRef.current = onSnapshot(collection(db, 'wc_matches'), (snap) => {
+      const list = snap.docs.map(d => Object.assign({ id: d.id }, d.data()) as WCMatch);
+      wcMatchesRef.current = list;
+
+      // Goal detection: a match whose score went up since the last snapshot.
+      const prev = wcPrevScoresRef.current;
+      const next: Record<string, { h: number; a: number }> = {};
+      let goal: { id: string; side: 'home' | 'away' } | null = null;
+      for (const m of list) {
+        const h = Number(m.homeScore) || 0, a = Number(m.awayScore) || 0;
+        next[m.id!] = { h, a };
+        const p = prev[m.id!];
+        if (p) {
+          if (h > p.h) goal = { id: m.id!, side: 'home' };
+          else if (a > p.a) goal = { id: m.id!, side: 'away' };
+        }
+      }
+      wcPrevScoresRef.current = next;
+      if (goal) {
+        setWcGoal(goal);
+        setTimeout(() => setWcGoal(g => (g && g.id === goal!.id ? null : g)), 7000);
+      }
+
+      setWcMatches(list);
+    }, (err) => console.error('wc_matches subscription error:', err));
+  }, [isWC]);
+
+  // Detach the warm wc_matches listener only when the Player unmounts.
+  useEffect(() => () => { wcUnsubRef.current?.(); wcUnsubRef.current = null; }, []);
+
+  // Tick every 30s so live-by-clock detection and "AO VIVO" stay current.
+  useEffect(() => {
+    if (!isWC) return;
+    const id = setInterval(() => setNowMs(Date.now()), 30000);
+    return () => clearInterval(id);
+  }, [isWC]);
+
+  const wcBrazil = useMemo(() => deriveBrazil(wcMatches || []), [wcMatches]);
+  const wcToday = useMemo(() => deriveToday(wcMatches || [], brasiliaTodayISO(nowMs)), [wcMatches, nowMs]);
+  const wcBracket = useMemo(() => deriveBracket(wcMatches || []), [wcMatches]);
+
+  // TV-side IA refresh, LIVE-ONLY to save resources: every 5 min, fetch only
+  // the game(s) currently live (kickoff passed, within the 2h window). If no
+  // game is live, nothing is fetched. Never rewrites a finished game. Gated by
+  // the card's autoRefresh toggle. Scheduled/future games are the admin's job.
+  useEffect(() => {
+    if (!isWC) return;
+    let cancelled = false;
+
+    const tick = async () => {
+      if (cancelled) return;
+      if (currentMedia?.payload?.autoRefresh === false) return;
+      if (document.visibilityState !== 'visible') return;
+      const live = (wcMatchesRef.current || []).filter(m => isLiveByClock(m, Date.now()));
+      if (live.length === 0) return; // no game happening → don't fetch
+      try {
+        const updates = await fetchWcPendingUpdates(live);
+        for (const u of updates) {
+          const existing = (wcMatchesRef.current || []).find(m => matchupKey(m) === matchupKey(u));
+          if (!existing || existing.status === 'finished') continue; // TV can't create or rewrite finished
+          await updateDoc(doc(db, 'wc_matches', existing.id!), {
+            homeScore: u.homeScore ?? null,
+            awayScore: u.awayScore ?? null,
+            homePens: u.homePens ?? null,
+            awayPens: u.awayPens ?? null,
+            status: u.status || 'scheduled',
+            time: u.time || existing.time || '',
+            updatedAt: serverTimestamp(),
+          }).catch(e => console.error('wc_matches update error:', e));
+        }
+      } catch (e) {
+        console.error('World Cup live refresh error:', e);
+      }
+    };
+
+    const startId = setTimeout(tick, Math.floor(Math.random() * 15000)); // small startup jitter
+    const loopId = setInterval(tick, WC_LIVE_REFRESH_MS);
+    return () => { cancelled = true; clearTimeout(startId); clearInterval(loopId); };
+  }, [isWC, currentMedia?.payload?.autoRefresh]);
+
+  // Smart Media: subscribe to the `sales` collection in real time (last 5)
+  useEffect(() => {
+    if (currentMedia?.type !== 'SMART_SALES') {
+      setSales([]);
+      knownSaleIdsRef.current = null;
+      return;
+    }
+
+    const scope = currentMedia.payload?.scope || 'latest';
+    const q = query(collection(db, 'sales'), orderBy('soldAt', 'desc'), limit(5));
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      let docs = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Sale));
+
+      if (scope === 'month') {
+        const now = new Date();
+        docs = docs.filter(s => {
+          if (!s.soldAt) return false;
+          const d = new Date(s.soldAt);
+          return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
+        });
+      }
+
+      // Detect a brand-new top sale for the celebration (skip the first load)
+      const topId = docs[0]?.id;
+      if (knownSaleIdsRef.current === null) {
+        knownSaleIdsRef.current = new Set(docs.map(s => s.id));
+      } else if (topId && !knownSaleIdsRef.current.has(topId)) {
+        knownSaleIdsRef.current = new Set(docs.map(s => s.id));
+        if (currentMedia.payload?.celebrate !== false) {
+          setNewSaleId(topId);
+          setTimeout(() => setNewSaleId(prev => (prev === topId ? null : prev)), 6000);
+        }
+      }
+
+      setSales(docs);
+    }, (err) => {
+      console.error('Error subscribing to sales:', err);
+    });
+
+    return () => unsubscribe();
+  }, [currentMedia?.id, currentMedia?.type, currentMedia?.payload?.scope]);
 
   useEffect(() => {
     if (currentMedia?.type === 'CAROUSEL' && currentMedia.payload.images?.length > 0) {
@@ -1001,58 +1315,135 @@ export function Player() {
       setCarouselIndex(0);
     }
   }, [currentMedia?.id, newsItems.length]);
+  // 6.1 Warm media cache — subscribe to every media doc in the playlist ONCE
+  // and keep the listeners alive. Rotation then reads from memory with zero
+  // network wait (the same trick that fixed the WC cards' cold start), and
+  // admin edits still stream in live.
+  const [mediaCache, setMediaCache] = useState<Record<string, Media | null>>({});
+  const mediaSubsRef = useRef<Record<string, () => void>>({});
+
+  useEffect(() => {
+    if (!playlist) return;
+    const ids: string[] = [];
+    for (const it of playlist.items) {
+      if (ids.indexOf(it.media_id) === -1) ids.push(it.media_id);
+    }
+
+    for (const id of ids) {
+      if (mediaSubsRef.current[id]) continue; // already warm
+      mediaSubsRef.current[id] = onSnapshot(doc(db, 'media', id), (docSnap) => {
+        const next = docSnap.exists() ? (Object.assign({ id: docSnap.id }, docSnap.data()) as Media) : null;
+        setMediaCache(prev => Object.assign({}, prev, { [id]: next }));
+      }, (err) => {
+        handleFirestoreError(err, OperationType.GET, `media/${id}`);
+      });
+    }
+
+    // Drop listeners for media no longer in the playlist.
+    for (const id of Object.keys(mediaSubsRef.current)) {
+      if (ids.indexOf(id) === -1) {
+        mediaSubsRef.current[id]();
+        delete mediaSubsRef.current[id];
+      }
+    }
+  }, [playlist]);
+
+  useEffect(() => () => {
+    const subs = mediaSubsRef.current;
+    for (const id of Object.keys(subs)) subs[id]();
+    mediaSubsRef.current = {};
+  }, []);
+
+  // 6.2 Asset warm-up — decode the next card's images ahead of the swap and
+  // remember which URLs are ready, so the commit below can wait on them.
+  // Two sets on purpose: "started" dedupes the downloads, "ready" records what
+  // actually finished decoding. Collapsing them into one would make the gate
+  // below think an in-flight image was already painted.
+  const assetsStartedRef = useRef<Set<string>>(new Set());
+  const assetsReadyRef = useRef<Set<string>>(new Set());
+  const [assetTick, setAssetTick] = useState(0);
+
+  const warmAssets = React.useCallback((urls: string[]) => {
+    for (const url of urls) {
+      if (assetsStartedRef.current.has(url)) continue;
+      assetsStartedRef.current.add(url);
+      const img = new Image();
+      const done = () => {
+        assetsReadyRef.current.add(url);
+        setAssetTick(v => v + 1);
+      };
+      img.onload = done;
+      img.onerror = done; // a broken image must never stall the playlist
+      img.src = url;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!playlist || playlist.items.length <= 1) return;
+    const nextIndex = (currentIndex + 1) % playlist.items.length;
+    const next = mediaCache[playlist.items[nextIndex].media_id];
+    if (next) warmAssets(heroAssetsOf(next));
+  }, [playlist, currentIndex, mediaCache, warmAssets]);
+
+  // 6.3 Commit — promote currentIndex into the visible slot, but only once the
+  // card can actually paint. While we wait the CURRENT card stays on screen, so
+  // a slow doc or a slow image shows the previous card instead of black.
+  const gateRef = useRef<{ key: string; startedAt: number } | null>(null);
+  const skipsRef = useRef(0);
+
   useEffect(() => {
     if (!playlist || playlist.items.length === 0) return;
-    const mediaId = playlist.items[currentIndex].media_id;
-    
-    const unsubscribe = onSnapshot(doc(db, 'media', mediaId), (docSnap) => {
-      if (docSnap.exists()) {
-        setCurrentMedia(Object.assign({ id: docSnap.id }, docSnap.data()) as Media);
-      } else {
-        setCurrentMedia(null);
+    const item = playlist.items[currentIndex];
+    if (!item) return;
+
+    const target = mediaCache[item.media_id];
+    if (target === undefined) return; // doc not in yet — hold the current card
+
+    // Media referenced by the playlist but deleted: skip ahead rather than
+    // burning this slot's duration on a blank screen. Bounded by one lap around
+    // the playlist so an all-deleted playlist can't spin in a render loop.
+    if (target === null) {
+      if (playlist.items.length > 1 && skipsRef.current < playlist.items.length) {
+        skipsRef.current += 1;
+        handleNext();
       }
-    }, (err) => {
-      handleFirestoreError(err, OperationType.GET, `media/${mediaId}`);
-    });
+      return;
+    }
+    skipsRef.current = 0;
 
-    return () => unsubscribe();
-  }, [playlist, currentIndex]);
+    const key = `${currentIndex}-${target.id}`;
 
-  // 6.1 Preload Next Media (Performance Optimization)
-  useEffect(() => {
-    if (!playlist || playlist.items.length <= 1 || status !== 'PLAYING') return;
-    
-    const nextIndex = (currentIndex + 1) % playlist.items.length;
-    const nextMediaId = playlist.items[nextIndex].media_id;
-    
-    // Fetch next media doc to trigger image preloading
-    const unsubscribe = onSnapshot(doc(db, 'media', nextMediaId), (docSnap) => {
-      if (docSnap.exists()) {
-        const data = docSnap.data();
-        // Preload images if applicable
-        if (data.type === 'IMAGE_HERO' && data.payload?.url) {
-          const img = new Image();
-          img.src = data.payload.url;
-        } else if (data.type === 'CAROUSEL' && data.payload?.images) {
-          data.payload.images.slice(0, 3).forEach((imgObj: any) => {
-            if (imgObj.url) {
-              const img = new Image();
-              img.src = imgObj.url;
-            }
-          });
-        } else if (data.type === 'NEWS_CLIPPING' && data.payload?.images) {
-          data.payload.images.slice(0, 2).forEach((imgObj: any) => {
-            if (imgObj.url) {
-              const img = new Image();
-              img.src = imgObj.url;
-            }
-          });
-        }
-      }
-    });
+    // Same slot: adopt payload edits in place. The key is unchanged, so this
+    // re-renders without remounting (and without a crossfade).
+    if (slot && slot.index === currentIndex && slot.media.id === target.id) {
+      if (slot.media !== target) setSlot({ index: currentIndex, media: target, seq: slot.seq });
+      return;
+    }
 
-    return () => unsubscribe();
-  }, [playlist, currentIndex, status]);
+    const commit = () => {
+      gateRef.current = null;
+      setSlot(prev => ({ index: currentIndex, media: target, seq: (prev?.seq ?? 0) + 1 }));
+    };
+
+    // Nothing to wait on for cards that draw straight from their payload.
+    const pending = heroAssetsOf(target).filter(u => !assetsReadyRef.current.has(u));
+    if (pending.length === 0) {
+      commit();
+      return;
+    }
+
+    warmAssets(pending);
+    if (!gateRef.current || gateRef.current.key !== key) {
+      gateRef.current = { key, startedAt: Date.now() };
+    }
+    if (Date.now() - gateRef.current.startedAt >= ASSET_GATE_MS) {
+      commit(); // cap reached — swap anyway
+      return;
+    }
+
+    const retry = setTimeout(() => setAssetTick(v => v + 1), 120);
+    return () => clearTimeout(retry);
+  }, [playlist, currentIndex, mediaCache, slot, assetTick, warmAssets, handleNext]);
 
   const getWeatherIcon = (condition: string) => {
     const c = condition?.toLowerCase() || '';
@@ -1076,76 +1467,13 @@ export function Player() {
     return <CloudSun size={28} />;
   };
 
-  if (!isPaired && status !== 'PLAYING') {
-    return (
-      <div className="fixed inset-0 bg-zinc-950 flex items-center justify-center p-8">
-        <div className="max-w-4xl w-full grid grid-cols-1 md:grid-cols-2 gap-12 items-center">
-          <div className="space-y-8">
-            <div className="flex items-center gap-4 text-adsplay">
-              <Tv size={48} />
-              <div className="h-8 w-px bg-zinc-800" />
-              <div className="flex flex-col">
-                <span className="text-sm font-black uppercase tracking-[0.3em]">Adsplay TV</span>
-                <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Soluções para ir além</span>
-              </div>
-            </div>
-            
-            <div className="space-y-4">
-              <h1 className="text-6xl font-black text-white leading-tight tracking-tighter">
-                Vincular <br /> esta TV
-              </h1>
-              <p className="text-zinc-400 text-xl leading-relaxed">
-                Abra o painel administrativo no seu celular ou computador e insira o código ao lado.
-              </p>
-            </div>
-
-            <div className="flex items-center gap-6 p-6 bg-zinc-900/50 rounded-3xl border border-zinc-800">
-              <div className={`w-3 h-3 rounded-full animate-pulse ${isOnline ? 'bg-adsplay' : 'bg-rose-500'}`} />
-              <div className="flex-1">
-                <p className="text-white font-bold">{isOnline ? 'Conectado à Internet' : 'Sem Conexão'}</p>
-                <p className="text-zinc-500 text-sm">{isOnline ? 'Aguardando pareamento...' : 'Verifique sua rede'}</p>
-              </div>
-              {isOnline && <Loader2 className="text-zinc-700 animate-spin" size={24} />}
-            </div>
-          </div>
-
-          <div className="flex flex-col items-center gap-8">
-            <div className="bg-white p-12 rounded-[3rem] shadow-2xl shadow-adsplay/10 flex flex-col items-center gap-6">
-              <div className="text-center space-y-2">
-                <p className="text-[10px] font-black text-zinc-400 uppercase tracking-[0.2em]">Código de Acesso</p>
-                <div className="text-8xl font-black text-zinc-950 tracking-tighter">
-                  {pairCode}
-                </div>
-              </div>
-              
-              <div className="w-full h-px bg-zinc-100" />
-              
-              <div className="flex flex-col items-center gap-4">
-                <div className="p-4 bg-zinc-50 rounded-2xl border border-zinc-100">
-                  <QRCodeSVG 
-                    value={window.location.origin} 
-                    size={160}
-                    level="H"
-                    includeMargin={false}
-                  />
-                </div>
-                <div className="flex items-center gap-2 text-zinc-400">
-                  <QrCode size={16} />
-                  <span className="text-[10px] font-bold uppercase tracking-widest">Escanear para Painel</span>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div className="fixed inset-0 bg-black overflow-hidden cursor-none group">
       {/* Fullscreen Overlay (Non-blocking and auto-hiding) */}
       <AnimatePresence>
-        {showFullscreenPrompt && !isFullscreen && !user && !promptDismissed && (
+        {/* Never nag on a playlist URL — it is usually embedded, where going
+            fullscreen makes no sense. */}
+        {showFullscreenPrompt && !isFullscreen && !user && !promptDismissed && !pinnedPlaylistId && (
           <motion.div 
             initial={{ y: -100, opacity: 0 }}
             animate={{ y: 0, opacity: 1 }}
@@ -1223,9 +1551,12 @@ export function Player() {
         </div>
       </div>
 
+      {/* Cards live in their own stacking context so the per-transition
+          z-index (below) can never climb over the top bar / progress bar. */}
+      <div className="absolute inset-0" style={{ isolation: 'isolate' }}>
       <AnimatePresence>
         {!currentMedia ? (
-          <motion.div 
+          <motion.div
             key="idle"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
@@ -1238,8 +1569,14 @@ export function Player() {
               <Tv size={80} className="text-zinc-800 relative" />
             </div>
             <div className="text-center space-y-2">
-              <h2 className="text-2xl font-bold text-zinc-500">Nenhuma programação ativa</h2>
-              <p className="text-zinc-700 font-medium">Aguardando playlist agendada para hoje...</p>
+              <h2 className="text-2xl font-bold text-zinc-500">
+                {pinnedMissing ? 'Playlist não encontrada' : 'Nenhuma programação ativa'}
+              </h2>
+              <p className="text-zinc-700 font-medium">
+                {pinnedMissing
+                  ? 'Confira o link — esta playlist pode ter sido removida.'
+                  : 'Aguardando playlist agendada para hoje...'}
+              </p>
             </div>
             <div className="flex items-center gap-3 px-4 py-2 bg-zinc-900 rounded-full border border-zinc-800">
               <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
@@ -1247,15 +1584,28 @@ export function Player() {
             </div>
           </motion.div>
         ) : (
-          <motion.div 
-            key={`${currentIndex}-${currentMedia.id}`}
+          <motion.div
+            key={`${slot!.index}-${currentMedia.id}`}
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            transition={{ duration: 1.0, ease: "easeInOut" }}
+            // The outgoing card holds FULL opacity for the whole crossfade while
+            // the incoming one fades in on top of it, then drops out once it is
+            // completely covered. Fading both at once (the old behaviour)
+            // composited ~75% luminance mid-transition — a visible dip toward
+            // black on the TVs.
+            exit={{ opacity: 0, transition: { duration: 0.2, delay: CARD_FADE_MS / 1000 } }}
+            transition={{ duration: CARD_FADE_MS / 1000, ease: 'easeInOut' }}
             className="absolute inset-0 overflow-hidden"
-            style={{ willChange: 'opacity' }}
+            style={{ willChange: 'opacity', zIndex: slot!.seq }}
           >
+            <CardBoundary mediaId={currentMedia.id} title={currentMedia.title}>
+            {!canRenderMedia(currentMedia) ? (
+              <CardPlaceholder
+                label={currentMedia.title || 'Conteúdo indisponível'}
+                detail={KNOWN_MEDIA_TYPES.has(currentMedia.type) ? 'Sem conteúdo configurado' : 'Player desatualizado'}
+              />
+            ) : (
+              <>
             {currentMedia.type === 'IMAGE_HERO' && <MediaImageHero payload={currentMedia.payload} />}
 
             {currentMedia.type === 'VIDEO_FILE' && <MediaVideoFile payload={currentMedia.payload} />}
@@ -1638,222 +1988,151 @@ export function Player() {
         </div>
       )}
 
-            {currentMedia.type === 'NORTH_STAR' && (
-              <div className="w-full h-full bg-[#050505] flex items-center justify-center p-24 relative overflow-hidden">
-                {/* Background Decoration */}
-                <div className="absolute top-0 right-0 w-[80vw] h-[80vw] bg-adsplay/10 blur-[150px] rounded-full -translate-y-1/2 translate-x-1/4" />
-                <div className="absolute bottom-0 left-0 w-[60vw] h-[60vw] bg-purple-500/10 blur-[120px] rounded-full translate-y-1/2 -translate-x-1/4" />
+            {currentMedia.type === 'NORTH_STAR' && (() => {
+              const p = currentMedia.payload || {};
+              const prog = Number(p.adsplay) || 0;   // "Programática" (Core)
+              const trig = Number(p.trigger) || 0;
+              const amax = Number(p.adsmax) || 0;
+              const pix = Number(p.pixel) || 0;
+              const pm = p.prevMetrics;
+              const metaCore = Number(p.metaCoreGoal) || 150;   // Programática + Trigger + Adsmax
+              const metaPix = Number(p.metaPixelGoal) || 500;   // Pixel
+              const coreSum = prog + trig + amax;               // feeds the 150 meta
+              const newBuTotal = trig + amax + pix;             // New BU (visual)
+              const grand = prog + trig + amax + pix;
+              const prevGrand = pm ? (Number(pm.adsplay) || 0) + (Number(pm.trigger) || 0) + (Number(pm.adsmax) || 0) + (Number(pm.pixel) || 0) : null;
 
-                <div className="w-full max-w-7xl space-y-20 relative z-10">
-                  <div className="text-center space-y-6">
-                    <div className="flex items-center justify-center gap-4">
-                      <div className="w-16 h-16 bg-adsplay/20 rounded-2xl flex items-center justify-center text-adsplay">
-                        <TrendingUp size={32} />
-                      </div>
-                      <span className="text-2xl font-black uppercase tracking-[0.5em] text-adsplay">North Star Metric</span>
-                    </div>
-                    <h2 className="text-9xl font-black text-white tracking-tighter leading-none">
-                      Meta de {currentMedia.payload.currentYear || new Date().getFullYear()}<span className="text-adsplay">.</span>
-                    </h2>
-                    <div className="flex flex-col items-center gap-4">
-                      <p className="text-4xl text-white font-bold tracking-widest uppercase">
-                        {currentMedia.payload.currentYearGoal || 200} campanhas ativas este ano
-                      </p>
-                      <p className="text-xl text-zinc-500 font-bold tracking-[0.3em] uppercase border-t border-white/10 pt-4">
-                        Objetivo North Star: {currentMedia.payload.targetGoal || 1000} campanhas até {currentMedia.payload.targetYear || 2030}
-                      </p>
-                    </div>
-                  </div>
-
-                  <div className="grid grid-cols-2 lg:grid-cols-5 gap-8 items-center">
-                    {/* Adsplay Card */}
-                    <div className="bg-zinc-900/40 p-8 rounded-[3rem] border border-white/5 space-y-4 text-center backdrop-blur-xl">
-                      <p className="text-zinc-500 font-black uppercase tracking-widest text-lg">Adsplay</p>
-                      <div className="text-7xl font-black text-white tracking-tighter">
-                        <Counter value={Number(currentMedia.payload.adsplay) || 0} />
-                      </div>
-                      <p className="text-zinc-600 font-bold uppercase tracking-widest text-xs">Campanhas Ativas</p>
-                    </div>
-
-                    {/* Pixel Card */}
-                    <div className="bg-zinc-900/40 p-8 rounded-[3rem] border border-white/5 space-y-4 text-center backdrop-blur-xl">
-                      <p className="text-zinc-500 font-black uppercase tracking-widest text-lg">Pixel</p>
-                      <div className="text-7xl font-black text-white tracking-tighter">
-                        <Counter value={Number(currentMedia.payload.pixel) || 0} />
-                      </div>
-                      <p className="text-zinc-600 font-bold uppercase tracking-widest text-xs">Campanhas Ativas</p>
-                    </div>
-
-                    {/* Trigger Card */}
-                    <div className="bg-zinc-900/40 p-8 rounded-[3rem] border border-white/5 space-y-4 text-center backdrop-blur-xl">
-                      <p className="text-zinc-500 font-black uppercase tracking-widest text-lg">Trigger</p>
-                      <div className="text-7xl font-black text-white tracking-tighter">
-                        <Counter value={Number(currentMedia.payload.trigger) || 0} />
-                      </div>
-                      <p className="text-zinc-600 font-bold uppercase tracking-widest text-xs">Campanhas Ativas</p>
-                    </div>
-
-                    {/* AdsMax Card */}
-                    <div className="bg-zinc-900/40 p-8 rounded-[3rem] border border-white/5 space-y-4 text-center backdrop-blur-xl">
-                      <p className="text-zinc-500 font-black uppercase tracking-widest text-lg">AdsMax</p>
-                      <div className="text-7xl font-black text-white tracking-tighter">
-                        <Counter value={Number(currentMedia.payload.adsmax) || 0} />
-                      </div>
-                      <p className="text-zinc-600 font-bold uppercase tracking-widest text-xs">Campanhas Ativas</p>
-                    </div>
-
-                    {/* Total Center Piece */}
-                    <div className="relative flex flex-col items-center justify-center py-8 col-span-2 lg:col-span-1">
-                      <div className="absolute inset-0 bg-adsplay/20 blur-[80px] rounded-full animate-pulse" />
-                      <div className="relative space-y-2 text-center">
-                        <p className="text-adsplay font-black uppercase tracking-[0.4em] text-xl">Total Geral</p>
-                        <div className="text-[10rem] font-black text-white leading-none tracking-tighter">
-                          {(() => {
-                            const sum = (Number(currentMedia.payload.adsplay) || 0) + 
-                                        (Number(currentMedia.payload.pixel) || 0) + 
-                                        (Number(currentMedia.payload.trigger) || 0) + 
-                                        (Number(currentMedia.payload.adsmax) || 0);
-                            return <Counter value={sum} />;
-                          })()}
-                        </div>
-                        <div className="flex items-center justify-center gap-4">
-                          <div className="h-1 w-16 bg-zinc-800 rounded-full" />
-                          <span className="text-zinc-400 font-black text-3xl tracking-tighter">/ {Number(currentMedia.payload.currentYearGoal) || 200}</span>
-                          <div className="h-1 w-16 bg-zinc-800 rounded-full" />
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Progress Bars */}
-                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-12">
-                    {/* Current Year Progress */}
-                    {(() => {
-                      const sum = (Number(currentMedia.payload.adsplay) || 0) + 
-                                  (Number(currentMedia.payload.pixel) || 0) + 
-                                  (Number(currentMedia.payload.trigger) || 0) + 
-                                  (Number(currentMedia.payload.adsmax) || 0);
-                      const goal = Number(currentMedia.payload.currentYearGoal) || 200;
-                      const rawYearPercentage = Math.round((sum / goal) * 100);
-                      const yearPercentage = isNaN(rawYearPercentage) ? 0 : rawYearPercentage;
-                      
-                      return (
-                        <div className="space-y-6">
-                          <div className="flex justify-between items-end px-4">
-                            <div className="space-y-1">
-                              <p className="text-zinc-500 font-black uppercase tracking-widest text-sm">Progresso {currentMedia.payload.currentYear || new Date().getFullYear()}</p>
-                              <p className="text-4xl font-black text-white">
-                                <Counter value={yearPercentage} />%
-                              </p>
-                            </div>
-                            <div className="text-right space-y-1">
-                              <p className="text-zinc-500 font-black uppercase tracking-widest text-sm">Faltam para Meta {currentMedia.payload.currentYear || new Date().getFullYear()}</p>
-                              <p className="text-4xl font-black text-adsplay">
-                                <Counter value={Math.max(0, goal - sum)} />
-                              </p>
-                            </div>
-                          </div>
-                          <div className="h-6 w-full bg-zinc-900 rounded-full p-1.5 border border-white/5 overflow-hidden">
-                            <motion.div 
-                              initial={{ width: 0 }}
-                              animate={{ width: `${Math.min(100, yearPercentage)}%` }}
-                              transition={{ duration: 2, ease: "easeOut" }}
-                              className="h-full bg-gradient-to-r from-adsplay to-emerald-500 rounded-full shadow-[0_0_20px_rgba(16,185,129,0.3)]"
-                            />
-                          </div>
-                        </div>
-                      );
-                    })()}
-
-                    {/* North Star Progress */}
-                    {(() => {
-                      const sum = (Number(currentMedia.payload.adsplay) || 0) + 
-                                  (Number(currentMedia.payload.pixel) || 0) + 
-                                  (Number(currentMedia.payload.trigger) || 0) + 
-                                  (Number(currentMedia.payload.adsmax) || 0);
-                      const target = Number(currentMedia.payload.targetGoal) || 1000;
-                      const rawNorthStarPercentage = Math.round((sum / target) * 100);
-                      const nsPercentage = isNaN(rawNorthStarPercentage) ? 0 : rawNorthStarPercentage;
-
-                      return (
-                        <div className="space-y-6">
-                          <div className="flex justify-between items-end px-4">
-                            <div className="space-y-1">
-                              <p className="text-zinc-500 font-black uppercase tracking-widest text-sm">Progresso North Star</p>
-                              <p className="text-4xl font-black text-white">
-                                <Counter value={nsPercentage} />%
-                              </p>
-                            </div>
-                            <div className="text-right space-y-1">
-                              <p className="text-zinc-500 font-black uppercase tracking-widest text-sm">Faltam para {currentMedia.payload.targetYear || 2030}</p>
-                              <p className="text-4xl font-black text-purple-500">
-                                <Counter value={Math.max(0, target - sum)} />
-                              </p>
-                            </div>
-                          </div>
-                          <div className="h-6 w-full bg-zinc-900 rounded-full p-1.5 border border-white/5 overflow-hidden">
-                            <motion.div 
-                              initial={{ width: 0 }}
-                              animate={{ width: `${Math.min(100, nsPercentage)}%` }}
-                              transition={{ duration: 2, ease: "easeOut" }}
-                              className="h-full bg-gradient-to-r from-purple-600 to-adsplay rounded-full shadow-[0_0_20px_rgba(147,51,234,0.3)]"
-                            />
-                          </div>
-                        </div>
-                      );
-                    })()}
+              const card = (label: string, value: number, prevVal?: number | null, accent = 'text-white') => (
+                <div className="bg-zinc-900/40 rounded-[2rem] border border-white/5 flex flex-col items-center justify-center gap-3 text-center h-full py-8">
+                  <p className="text-zinc-400 font-black uppercase tracking-widest text-xl">{label}</p>
+                  <div className={`text-[7.5rem] leading-[0.85] font-black ${accent} tracking-tighter`}><Counter value={value} /></div>
+                  <div className="flex items-center gap-3">
+                    <NSDelta prev={prevVal} cur={value} size="text-base" />
+                    <span className="text-zinc-600 font-bold uppercase tracking-widest text-xs">Campanhas</span>
                   </div>
                 </div>
-              </div>
-            )}
+              );
 
-            {currentMedia.type === 'WEBSITE_EMBED' && currentMedia.payload && (
-              <div className="w-full h-full bg-zinc-950 flex items-center justify-center p-12 relative overflow-hidden">
-                <div className="absolute inset-0 bg-gradient-to-br from-adsplay/10 via-transparent to-purple-500/10" />
-                
-                <div className="w-full max-w-7xl space-y-8 relative z-10">
-                  <div className="flex justify-between items-end border-b border-white/10 pb-6">
-                    <div className="space-y-3">
-                      <div className="flex items-center gap-3">
-                        <div className="w-10 h-10 bg-adsplay/10 rounded-xl flex items-center justify-center text-adsplay">
-                          <Globe size={20} />
+              const metaBar = (title: string, sub: string, value: number, goal: number, grad: string) => {
+                const pct = goal > 0 ? Math.round((value / goal) * 100) : 0;
+                const over = pct > 100;
+                const surplus = Math.max(0, value - goal);
+
+                // Past the goal the bar rescales instead of sitting pinned at
+                // 100%: the fill runs the whole track and the goal line moves
+                // INSIDE it, so the stretch beyond the mark is the overshoot.
+                const barMax = Math.max(100, pct);
+                const fillPct = (pct / barMax) * 100;
+                const goalMarkPct = (100 / barMax) * 100;
+
+                return (
+                  <div className="flex flex-col justify-center gap-5 h-full">
+                    <div className="flex justify-between items-end px-1 gap-6">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-4 flex-wrap">
+                          <p className="text-white font-black uppercase tracking-widest text-3xl">{title}</p>
+                          {over && (
+                            <span className="px-4 py-1.5 rounded-full bg-amber-400 text-black font-black uppercase tracking-widest text-base flex items-center gap-2 shadow-[0_0_30px_-5px_rgba(251,191,36,0.7)]">
+                              <Trophy size={18} /> +{pct - 100}% acima da meta
+                            </span>
+                          )}
                         </div>
-                        <span className="text-[10px] font-black uppercase tracking-[0.4em] text-adsplay">Website Preview</span>
+                        <p className="text-zinc-500 font-bold uppercase tracking-widest text-sm mt-2">{sub}</p>
                       </div>
-                      <h2 className="text-4xl font-black text-white tracking-tighter leading-none">
-                        {currentMedia.title}<span className="text-adsplay">.</span>
-                      </h2>
-                    </div>
-                    <div className="flex flex-col items-end gap-3">
-                      <div className="flex items-center gap-2">
-                        <div className="w-1.5 h-1.5 rounded-full bg-adsplay animate-pulse" />
-                        <p className="text-zinc-500 text-[9px] font-black uppercase tracking-[0.2em]">
-                          Live Snapshot — {currentMedia.payload.url}
+                      <div className="text-right shrink-0">
+                        <p className={`text-7xl font-black leading-none tracking-tighter ${over ? 'text-amber-300' : 'text-white'}`}>
+                          <Counter value={pct} />%
+                        </p>
+                        <p className="text-zinc-400 font-black text-xl mt-2">
+                          {value} / {goal} · {over ? `+${surplus} campanhas` : `faltam ${goal - value}`}
                         </p>
                       </div>
                     </div>
-                  </div>
 
-                  <div className="relative aspect-video rounded-[2.5rem] overflow-hidden border-8 border-white/5 shadow-[0_40px_80px_-15px_rgba(0,0,0,0.8)] bg-zinc-900">
-                    {currentMedia.payload.screenshotUrl ? (
-                      <img 
-                        src={currentMedia.payload.screenshotUrl} 
-                        alt={currentMedia.title}
-                        className="w-full h-full object-cover"
-                        referrerPolicy="no-referrer"
-                      />
-                    ) : (
-                      <div className="w-full h-full flex items-center justify-center text-zinc-800">
-                        <Globe size={120} />
+                    <div className={`h-9 w-full bg-zinc-900 rounded-full p-2 border ${over ? 'border-amber-400/40' : 'border-white/5'}`}>
+                      <div className="relative h-full w-full rounded-full overflow-hidden">
+                        <motion.div
+                          initial={{ width: 0 }}
+                          animate={{ width: `${fillPct}%` }}
+                          transition={{ duration: 2, ease: 'easeOut' }}
+                          className={`absolute inset-y-0 left-0 bg-gradient-to-r rounded-full ${over ? 'from-adsplay via-emerald-400 to-amber-300' : grad}`}
+                        />
+                        {over && (
+                          <div className="absolute inset-y-0 w-[3px] bg-black/70" style={{ left: `${goalMarkPct}%` }} />
+                        )}
+                      </div>
+                    </div>
+
+                    {over && (
+                      <div className="relative h-4 -mt-2">
+                        <span
+                          className="absolute -translate-x-1/2 text-xs font-black uppercase tracking-widest text-zinc-500 whitespace-nowrap"
+                          style={{ left: `${goalMarkPct}%` }}
+                        >
+                          meta {goal}
+                        </span>
                       </div>
                     )}
-                    
-                    {/* Overlay for "Print" look */}
-                    <div className="absolute inset-0 pointer-events-none border-[20px] border-white/5 rounded-[2rem]" />
+                  </div>
+                );
+              };
+
+              return (
+                <div className="w-full h-full bg-[#050505] flex flex-col p-14 gap-10 relative overflow-hidden">
+                  <div className="absolute top-0 right-0 w-[70vw] h-[70vw] bg-adsplay/10 blur-[140px] rounded-full -translate-y-1/2 translate-x-1/4" />
+                  <div className="absolute bottom-0 left-0 w-[50vw] h-[50vw] bg-purple-500/10 blur-[120px] rounded-full translate-y-1/2 -translate-x-1/4" />
+
+                  {/* Header */}
+                  <div className="flex items-end justify-between gap-8 relative z-10 shrink-0">
+                    <div className="space-y-4">
+                      <div className="flex items-center gap-4">
+                        <div className="w-16 h-16 bg-adsplay/20 rounded-2xl flex items-center justify-center text-adsplay"><TrendingUp size={36} /></div>
+                        <span className="text-2xl font-black uppercase tracking-[0.4em] text-adsplay">North Star Metric</span>
+                      </div>
+                      <h2 className="text-8xl font-black text-white tracking-tighter leading-none">Meta de {p.currentYear || new Date().getFullYear()}<span className="text-adsplay">.</span></h2>
+                    </div>
+                    <div className="text-right">
+                      <p className="text-zinc-500 font-black uppercase tracking-[0.3em] text-lg">Total Geral</p>
+                      <div className="text-[9rem] font-black text-white leading-[0.8] tracking-tighter"><Counter value={grand} /></div>
+                      {prevGrand != null && (
+                        <div className="flex items-center justify-end gap-3 mt-3">
+                          <NSDelta prev={prevGrand} cur={grand} size="text-xl" />
+                          <span className="text-zinc-600 font-bold uppercase tracking-[0.15em] text-xs">vs. última</span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* BUs — grow to fill vertical space */}
+                  <div className="grid grid-cols-1 lg:grid-cols-[1fr_3fr] gap-8 relative z-10 flex-1 min-h-0">
+                    <div className="bg-white/[0.02] rounded-[2.5rem] border border-adsplay/20 p-7 flex flex-col gap-5">
+                      <div className="flex items-baseline justify-between px-1 shrink-0">
+                        <span className="text-adsplay font-black uppercase tracking-[0.3em] text-2xl">Core</span>
+                        <span className="text-zinc-500 font-bold text-sm uppercase tracking-widest">Total <span className="text-white font-black text-2xl">{prog}</span></span>
+                      </div>
+                      <div className="flex-1 min-h-0">{card('Programática', prog, pm?.adsplay, 'text-adsplay')}</div>
+                    </div>
+                    <div className="bg-white/[0.02] rounded-[2.5rem] border border-purple-500/20 p-7 flex flex-col gap-5">
+                      <div className="flex items-baseline justify-between px-1 shrink-0">
+                        <span className="text-purple-400 font-black uppercase tracking-[0.3em] text-2xl">New</span>
+                        <span className="text-zinc-500 font-bold text-sm uppercase tracking-widest">Total <span className="text-white font-black text-2xl">{newBuTotal}</span></span>
+                      </div>
+                      <div className="grid grid-cols-3 gap-6 flex-1 min-h-0">
+                        {card('Trigger', trig, pm?.trigger)}
+                        {card('Adsmax', amax, pm?.adsmax)}
+                        {card('Pixel', pix, pm?.pixel, 'text-purple-400')}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Metas */}
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-16 relative z-10 shrink-0">
+                    {metaBar('Meta Core', 'Programática + Trigger + Adsmax', coreSum, metaCore, 'from-adsplay to-emerald-500')}
+                    {metaBar('Meta Pixel', 'Somente Pixel', pix, metaPix, 'from-purple-600 to-adsplay')}
                   </div>
                 </div>
-              </div>
-            )}
+              );
+            })()}
 
             {currentMedia.type === 'WEATHER' && currentMedia.payload && (
               <div className={`w-full h-full flex items-center justify-center p-24 relative overflow-hidden transition-all duration-1000 ${
@@ -1972,13 +2251,674 @@ export function Player() {
               </div>
             )}
 
-            {/* Unknown Media Type Fallback */}
-            {!['IMAGE_HERO', 'VIDEO_FILE', 'YOUTUBE', 'DASHBOARD', 'INSTAGRAM', 'CAROUSEL', 'NEWS_CLIPPING', 'MONTHLY_GOAL', 'WEATHER', 'NORTH_STAR'].includes(currentMedia.type) && (
-              <div className="w-full h-full flex flex-col items-center justify-center text-white bg-zinc-900">
-                <p className="text-2xl font-bold">Tipo de mídia desconhecido</p>
-                <p className="text-zinc-500">{currentMedia.type}</p>
-              </div>
+            {currentMedia.type === 'FINAL_SPRINT' && (() => {
+              const target = Number(currentMedia.payload.target) || 1;
+              const current = Number(currentMedia.payload.current) || 0;
+              const remaining = Math.max(0, target - current);
+              const percentage = Math.min(100, Math.round((current / target) * 100));
+              const label = currentMedia.payload.label || 'vendas';
+              const month = currentMedia.payload.month || '';
+              const teamName = currentMedia.payload.teamName || '';
+              const isGoalHit = current >= target;
+              const fmtBR = (n: number) => `R$ ${n.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+              return (
+                <div className="w-full h-full bg-[#060606] flex flex-col items-center justify-center relative overflow-hidden">
+                  {/* Atmospheric glow */}
+                  <div className="absolute inset-0 pointer-events-none">
+                    <motion.div
+                      animate={{ scale: [1, 1.3, 1], opacity: isGoalHit ? [0.3, 0.5, 0.3] : [0.15, 0.3, 0.15] }}
+                      transition={{ duration: 4, repeat: Infinity, ease: "easeInOut" }}
+                      className={`absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[100vw] h-[100vw] rounded-full blur-[200px] ${isGoalHit ? 'bg-emerald-700/30' : 'bg-violet-900/40'}`}
+                    />
+                    {!isGoalHit && [...Array(7)].map((_, i) => (
+                      <motion.div
+                        key={i}
+                        initial={{ y: '100vh', opacity: 0 }}
+                        animate={{ y: ['100vh', '60vh', '10vh', '-10vh'], opacity: [0, 1, 0.6, 0] }}
+                        transition={{ duration: 2.5 + i * 0.4, repeat: Infinity, delay: i * 0.6, ease: "easeOut" }}
+                        className="absolute text-3xl"
+                        style={{ left: `${10 + i * 12}%`, willChange: 'transform' }}
+                      >
+                        🔥
+                      </motion.div>
+                    ))}
+                  </div>
+
+                  {/* Header badge */}
+                  <motion.div
+                    initial={{ y: -40, opacity: 0 }}
+                    animate={{ y: 0, opacity: 1 }}
+                    transition={{ delay: 0.3 }}
+                    className="absolute top-20 left-0 right-0 flex justify-center z-10"
+                  >
+                    <div className="flex items-center gap-4 px-10 py-4 bg-white/5 backdrop-blur-md rounded-full border border-white/10">
+                      <motion.span
+                        animate={{ rotate: isGoalHit ? [0, -20, 20, 0] : [-10, 10, -10] }}
+                        transition={{ duration: isGoalHit ? 0.6 : 1, repeat: Infinity }}
+                        className="text-3xl"
+                      >
+                        {isGoalHit ? '🏆' : '🦙'}
+                      </motion.span>
+                      <span className="text-sm font-black text-white/80 uppercase tracking-[0.5em]">
+                        Sprint Final{month ? ` — ${month}` : ''}{teamName ? ` · ${teamName}` : ''}
+                      </span>
+                      {!isGoalHit && (
+                        <motion.span
+                          animate={{ opacity: [1, 0.2, 1] }}
+                          transition={{ duration: 0.8, repeat: Infinity }}
+                          className="text-3xl"
+                        >
+                          ⚡
+                        </motion.span>
+                      )}
+                    </div>
+                  </motion.div>
+
+                  {/* Main content */}
+                  <div className="relative z-10 flex flex-col items-center w-full max-w-5xl px-20 gap-8">
+                    {isGoalHit ? (
+                      <motion.div
+                        initial={{ scale: 0.5, opacity: 0 }}
+                        animate={{ scale: 1, opacity: 1 }}
+                        transition={{ type: "spring", stiffness: 200 }}
+                        className="text-center space-y-6"
+                      >
+                        <motion.div
+                          animate={{ scale: [1, 1.04, 1] }}
+                          transition={{ duration: 1.5, repeat: Infinity, ease: "easeInOut" }}
+                          className="text-[clamp(5rem,16vw,14rem)] font-black leading-none tracking-tighter text-transparent bg-clip-text bg-gradient-to-b from-emerald-300 to-emerald-500"
+                          style={{ filter: 'drop-shadow(0 0 60px rgba(16,185,129,0.4))' }}
+                        >
+                          META<br />BATIDA!
+                        </motion.div>
+                        <p className="text-4xl font-black text-emerald-400 uppercase tracking-widest">
+                          A lhama chegou lá! 🦙🎉
+                        </p>
+                      </motion.div>
+                    ) : (
+                      <div className="w-full flex flex-col items-center gap-4">
+                        <motion.p
+                          initial={{ opacity: 0, y: 20 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          className="text-2xl font-black text-zinc-500 uppercase tracking-[0.4em]"
+                        >
+                          Falta para a meta{month && <span className="text-adsplay"> {month}</span>}
+                        </motion.p>
+
+                        <motion.div
+                          animate={{ scale: [1, 1.015, 1] }}
+                          transition={{ duration: 2, repeat: Infinity, ease: "easeInOut" }}
+                          className="text-[clamp(3rem,12vw,12rem)] font-black text-white leading-none tracking-tighter"
+                          style={{ textShadow: '0 0 80px rgba(124,58,237,0.5)' }}
+                        >
+                          {fmtBR(remaining)}
+                        </motion.div>
+
+                        <motion.p
+                          initial={{ opacity: 0 }}
+                          animate={{ opacity: 1 }}
+                          transition={{ delay: 0.5 }}
+                          className="text-3xl font-black text-zinc-400 uppercase tracking-[0.3em] -mt-2"
+                        >
+                          {label}
+                        </motion.p>
+                      </div>
+                    )}
+
+                    {/* Progress bar + llama */}
+                    <div className="w-full space-y-0">
+                      <div className="flex justify-between items-end px-2 mb-2">
+                        <p className="text-xs font-black text-zinc-700 uppercase tracking-widest">0</p>
+                        <motion.p
+                          animate={{ opacity: !isGoalHit ? [1, 0.4, 1] : 1 }}
+                          transition={{ duration: 1.5, repeat: !isGoalHit ? Infinity : 0 }}
+                          className={`text-base font-black uppercase tracking-widest ${isGoalHit ? 'text-emerald-400' : 'text-adsplay'}`}
+                        >
+                          {percentage}% atingido
+                        </motion.p>
+                        <p className="text-xs font-black text-zinc-700 uppercase tracking-widest">{target} {label}</p>
+                      </div>
+
+                      <div className="relative h-10 w-full bg-zinc-900 rounded-full border border-white/5 overflow-hidden">
+                        <motion.div
+                          initial={{ width: 0 }}
+                          animate={{ width: `${percentage}%` }}
+                          transition={{ duration: 2.5, ease: "easeOut" }}
+                          className={`h-full rounded-full relative overflow-hidden ${isGoalHit ? 'bg-gradient-to-r from-emerald-500 to-emerald-400' : 'bg-gradient-to-r from-adsplay via-violet-500 to-fuchsia-500'}`}
+                        >
+                          <motion.div
+                            animate={{ x: ['-100%', '200%'] }}
+                            transition={{ duration: 1.8, repeat: Infinity, ease: "linear", repeatDelay: 0.3 }}
+                            className="absolute inset-0 bg-gradient-to-r from-transparent via-white/25 to-transparent skew-x-12"
+                          />
+                        </motion.div>
+                      </div>
+
+                      <div className="relative" style={{ height: '72px' }}>
+                        <motion.div
+                          initial={{ left: '1%' }}
+                          animate={{ left: `${Math.max(1, Math.min(93, percentage - 2))}%` }}
+                          transition={{ duration: 2.5, ease: "easeOut" }}
+                          className="absolute top-1 transform -translate-x-1/2"
+                        >
+                          <motion.div
+                            animate={{
+                              y: isGoalHit ? [0, -16, 0] : [0, -10, 0],
+                              rotate: isGoalHit ? [-15, 15, -15] : [-6, 6, -6]
+                            }}
+                            transition={{ duration: isGoalHit ? 0.5 : 0.7, repeat: Infinity }}
+                          >
+                            <span
+                              className="text-6xl block select-none"
+                              style={{ filter: 'drop-shadow(0 0 20px rgba(168,85,247,0.9))' }}
+                            >
+                              🦙
+                            </span>
+                          </motion.div>
+                          {!isGoalHit && (
+                            <motion.span
+                              animate={{ opacity: [0.7, 0], x: [-5, -20] }}
+                              transition={{ duration: 0.4, repeat: Infinity }}
+                              className="absolute top-4 -left-8 text-xl pointer-events-none"
+                            >
+                              💨
+                            </motion.span>
+                          )}
+                        </motion.div>
+                        <div className="absolute right-0 top-0 text-4xl select-none">🏁</div>
+                      </div>
+                    </div>
+
+                    {/* Bottom stats */}
+                    <motion.div
+                      initial={{ y: 24, opacity: 0 }}
+                      animate={{ y: 0, opacity: 1 }}
+                      transition={{ delay: 0.6 }}
+                      className="flex items-center gap-10"
+                    >
+                      <div className="text-center">
+                        <p className="text-[10px] font-black text-zinc-600 uppercase tracking-widest mb-1">Realizadas</p>
+                        <p className={`text-2xl font-black ${isGoalHit ? 'text-emerald-400' : 'text-white'}`}>{fmtBR(current)}</p>
+                      </div>
+                      <div className="w-px h-10 bg-zinc-800" />
+                      <div className="text-center">
+                        <p className="text-[10px] font-black text-zinc-600 uppercase tracking-widest mb-1">Meta</p>
+                        <p className="text-2xl font-black text-zinc-500">{fmtBR(target)}</p>
+                      </div>
+                      {!isGoalHit && (
+                        <>
+                          <div className="w-px h-10 bg-zinc-800" />
+                          <div className="text-center">
+                            <p className="text-[10px] font-black text-zinc-600 uppercase tracking-widest mb-1">Faltam</p>
+                            <motion.p
+                              animate={{ color: ['#ef4444', '#7C3AED', '#ef4444'] }}
+                              transition={{ duration: 2.5, repeat: Infinity }}
+                              className="text-2xl font-black"
+                            >
+                              {fmtBR(remaining)}
+                            </motion.p>
+                          </div>
+                        </>
+                      )}
+                    </motion.div>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {currentMedia.type === 'SMART_SALES' && (() => {
+              const valueDisplay = currentMedia.payload?.valueDisplay || 'full';
+              const fmtFull = (n: number) => `R$ ${n.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+              const fmtAbbrev = (n: number) => {
+                if (n >= 1_000_000) return `R$ ${(n / 1_000_000).toLocaleString('pt-BR', { maximumFractionDigits: 1 })} mi`;
+                if (n >= 1_000) return `R$ ${Math.round(n / 1_000).toLocaleString('pt-BR')} mil`;
+                return fmtFull(n);
+              };
+              const showValue = (s: Sale) => {
+                if (valueDisplay === 'hidden') return null;
+                const n = Number(s.investimentoValor) || 0;
+                if (!n && s.investimento) return s.investimento;
+                return valueDisplay === 'abbreviated' ? fmtAbbrev(n) : fmtFull(n);
+              };
+              const top = sales[0];
+              const rest = sales.slice(1, 5);
+
+              return (
+                <div className="w-full h-full bg-[#060606] flex flex-col relative overflow-hidden p-12 gap-8">
+                  {/* Atmospheric glow */}
+                  <div className="absolute inset-0 pointer-events-none">
+                    <motion.div
+                      animate={{ opacity: [0.15, 0.3, 0.15] }}
+                      transition={{ duration: 5, repeat: Infinity, ease: 'easeInOut' }}
+                      className="absolute top-1/3 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[80vw] h-[80vw] rounded-full blur-[200px] bg-emerald-700/30"
+                    />
+                  </div>
+
+                  {/* New-sale celebration (brief, lightweight ≤6 elements) */}
+                  {newSaleId && newSaleId === top?.id && (
+                    <div className="absolute inset-0 pointer-events-none z-30">
+                      {[...Array(6)].map((_, i) => (
+                        <motion.div
+                          key={i}
+                          initial={{ y: '110vh', opacity: 0 }}
+                          animate={{ y: '-10vh', opacity: [0, 1, 0] }}
+                          transition={{ duration: 2.2, delay: i * 0.18, ease: 'easeOut' }}
+                          className="absolute text-5xl"
+                          style={{ left: `${12 + i * 14}%`, willChange: 'transform' }}
+                        >
+                          🎉
+                        </motion.div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Header */}
+                  <div className="relative z-10 flex items-center gap-4">
+                    <span className="text-4xl">🏆</span>
+                    <div>
+                      <p className="text-sm font-black text-emerald-400 uppercase tracking-[0.4em]">Vendas Fechadas</p>
+                      <p className="text-xs font-bold text-zinc-600 uppercase tracking-widest">Adsplay Labs · em tempo real</p>
+                    </div>
+                  </div>
+
+                  {sales.length === 0 ? (
+                    <div className="relative z-10 flex-1 flex flex-col items-center justify-center text-center gap-4">
+                      <span className="text-7xl opacity-40">📭</span>
+                      <p className="text-2xl font-black text-zinc-600 uppercase tracking-widest">Aguardando a próxima venda</p>
+                    </div>
+                  ) : (
+                    <>
+                      {/* Featured (latest) sale */}
+                      {top && (
+                        <motion.div
+                          key={top.id}
+                          initial={{ opacity: 0, scale: 0.98 }}
+                          animate={{ opacity: 1, scale: 1 }}
+                          transition={{ duration: 0.5 }}
+                          className="relative z-10 rounded-[2rem] border border-emerald-500/20 bg-gradient-to-br from-emerald-950/40 to-zinc-900/60 p-10 flex items-center justify-between gap-8"
+                        >
+                          <div className="space-y-3 min-w-0">
+                            <span className="inline-block px-4 py-1 rounded-full bg-emerald-500/20 text-emerald-300 text-xs font-black uppercase tracking-widest">
+                              Última venda · {top.squad || '—'}
+                            </span>
+                            <p className="text-4xl font-black text-white leading-tight truncate">{top.executivo || top.squad || 'Venda fechada'}</p>
+                            <div className="flex flex-wrap gap-x-6 gap-y-1 text-sm font-bold text-zinc-400">
+                              {top.status && <span>{top.status}</span>}
+                              {top.pi && <span className="text-zinc-500">PI: <span className="text-zinc-300">{top.pi}</span></span>}
+                              {top.periodo && <span className="text-zinc-500">Período: <span className="text-zinc-300">{top.periodo}</span></span>}
+                              {top.cs && <span className="text-zinc-500">CS: <span className="text-zinc-300">{top.cs}</span></span>}
+                            </div>
+                          </div>
+                          {showValue(top) && (
+                            <div className="text-right shrink-0">
+                              <p className="text-[10px] font-black text-emerald-500 uppercase tracking-widest mb-1">Investimento</p>
+                              <p className="text-[clamp(2rem,5vw,4rem)] font-black text-transparent bg-clip-text bg-gradient-to-b from-emerald-300 to-emerald-500 leading-none"
+                                 style={{ filter: 'drop-shadow(0 0 30px rgba(16,185,129,0.3))' }}>
+                                {showValue(top)}
+                              </p>
+                            </div>
+                          )}
+                        </motion.div>
+                      )}
+
+                      {/* Previous sales (up to 4, smaller) */}
+                      {rest.length > 0 && (
+                        <div className="relative z-10 grid grid-cols-4 gap-4 flex-1">
+                          {rest.map((s) => (
+                            <div key={s.id} className="rounded-2xl border border-white/5 bg-white/[0.03] p-5 flex flex-col justify-between">
+                              <div className="space-y-1 min-w-0">
+                                <p className="text-[10px] font-black text-emerald-500 uppercase tracking-widest truncate">{s.squad || '—'}</p>
+                                <p className="text-base font-black text-white leading-tight line-clamp-2">{s.executivo || 'Venda'}</p>
+                                {s.status && <p className="text-[11px] font-bold text-zinc-500 truncate">{s.status}</p>}
+                              </div>
+                              {showValue(s) && (
+                                <p className="text-lg font-black text-emerald-400 mt-3 truncate">{showValue(s)}</p>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+              );
+            })()}
+
+            {/* World Cup — Brazil's journey + next match */}
+            {currentMedia.type === 'WC_BRAZIL' && (() => {
+              const results = wcBrazil.results;
+              const next = wcBrazil.nextMatch;
+              const loading = wcMatches === null;
+              return (
+                <div className="w-full h-full bg-gradient-to-b from-white to-zinc-100 flex flex-col p-16 gap-10 relative overflow-hidden">
+                  <div className="absolute top-0 left-0 right-0 h-3 bg-gradient-to-r from-emerald-500 via-yellow-400 to-emerald-500" />
+                  <div className="flex items-center gap-6 relative z-10">
+                    <TeamFlag code="br" imgClass="w-24 h-16" emojiClass="text-8xl" />
+                    <div>
+                      <h2 className="text-7xl font-black text-zinc-900 tracking-tighter leading-none">Seleção Brasileira</h2>
+                      <p className="text-emerald-600 font-black uppercase tracking-[0.3em] text-lg mt-3">Copa do Mundo FIFA 2026</p>
+                    </div>
+                  </div>
+
+                  {loading ? (
+                    <div className="flex-1 flex items-center justify-center text-zinc-400 text-3xl font-bold">Carregando dados da Copa...</div>
+                  ) : (
+                    <div className="flex-1 grid grid-cols-12 gap-10 relative z-10 min-h-0">
+                      <div className="col-span-5 flex flex-col">
+                        <h3 className="text-emerald-600 text-2xl font-black uppercase tracking-[0.25em] mb-5">Próximo Jogo</h3>
+                        {next ? (
+                          <div className="flex-1 bg-white border-2 border-emerald-100 rounded-[2.5rem] p-10 flex flex-col justify-center gap-10 shadow-xl shadow-emerald-900/5">
+                            <div className="flex items-center justify-center gap-10">
+                              <div className="flex flex-col items-center gap-4">
+                                <TeamFlag code="br" imgClass="w-32 h-20" emojiClass="text-8xl" />
+                                <span className="text-3xl font-black text-zinc-900">BRASIL</span>
+                              </div>
+                              <span className="text-5xl font-black text-zinc-300">×</span>
+                              <div className="flex flex-col items-center gap-4">
+                                <TeamFlag code={next.opponentCode} emoji={next.opponentFlag} imgClass="w-32 h-20" emojiClass="text-8xl" />
+                                <span className="text-3xl font-black text-zinc-900 text-center">{(next.opponent || 'A definir').toUpperCase()}</span>
+                              </div>
+                            </div>
+                            <div className="flex flex-col items-center gap-3 text-center">
+                              {next.stage && <span className="px-5 py-2 bg-emerald-500 text-white rounded-full text-sm font-black uppercase tracking-widest">{next.stage}</span>}
+                              <p className="text-5xl font-black text-zinc-900">{fmtBrDate(next.date) || 'A definir'}{next.time ? ` · ${next.time}` : ''}</p>
+                              <p className="text-lg text-zinc-400 font-bold uppercase tracking-widest">Horário de Brasília</p>
+                              {next.venue && <p className="text-xl text-zinc-500 font-bold">{next.venue}</p>}
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="flex-1 bg-white border-2 border-zinc-100 rounded-[2.5rem] p-10 flex items-center justify-center text-center text-zinc-400 text-2xl font-bold">Sem jogo agendado</div>
+                        )}
+                      </div>
+
+                      <div className="col-span-7 flex flex-col min-h-0">
+                        <h3 className="text-emerald-600 text-2xl font-black uppercase tracking-[0.25em] mb-5">Trajetória</h3>
+                        <div className="flex-1 space-y-3 overflow-hidden">
+                          {results.length === 0 ? (
+                            <div className="h-full flex items-center justify-center text-zinc-400 text-2xl font-bold">A seleção ainda não estreou</div>
+                          ) : results.slice(0, 8).map((r: any, i: number) => {
+                            const letter = wcResultLetter(Number(r.brScore) || 0, Number(r.advScore) || 0, r.brPens, r.advPens);
+                            const color = letter === 'V' ? 'bg-emerald-500' : letter === 'D' ? 'bg-rose-500' : 'bg-zinc-400';
+                            const hasPens = r.brPens != null && r.advPens != null;
+                            return (
+                              <div key={i} className="bg-white border border-zinc-200 rounded-2xl px-6 py-4 flex items-center gap-5 shadow-sm">
+                                <div className={`w-12 h-12 rounded-xl ${color} flex items-center justify-center text-white font-black text-xl shrink-0`}>{letter}</div>
+                                <div className="flex-1 flex items-center gap-3 min-w-0">
+                                  <TeamFlag code="br" imgClass="w-10 h-7" emojiClass="text-3xl" />
+                                  <span className="text-3xl font-black text-zinc-900">{Number(r.brScore) || 0}</span>
+                                  <span className="text-zinc-400 font-black text-2xl">×</span>
+                                  <span className="text-3xl font-black text-zinc-900">{Number(r.advScore) || 0}</span>
+                                  {hasPens && <span className="text-sm font-black text-emerald-600 shrink-0">({r.brPens}-{r.advPens} pên)</span>}
+                                  <TeamFlag code={r.opponentCode} emoji={r.opponentFlag} imgClass="w-10 h-7" emojiClass="text-3xl" />
+                                  <span className="text-2xl font-bold text-zinc-700 truncate">{r.opponent}</span>
+                                </div>
+                                <div className="flex flex-col items-end shrink-0 text-right">
+                                  {r.stage && <span className="text-xs font-black text-zinc-400 uppercase tracking-widest">{r.stage}</span>}
+                                  {r.date && <span className="text-xs font-bold text-zinc-400">{fmtBrDate(r.date)}</span>}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+
+            {/* World Cup — today's matches (live by clock + goal animation) */}
+            {currentMedia.type === 'WC_TODAY' && (() => {
+              const matches = wcToday;
+              const today = new Date(nowMs).toLocaleDateString('pt-BR', { weekday: 'long', day: '2-digit', month: 'long', timeZone: 'America/Sao_Paulo' });
+              const loading = wcMatches === null;
+              const showScore = (m: any) => m.homeScore != null && m.awayScore != null;
+              const liveNow = (m: any) => isLiveByClock(m, nowMs);
+              const badge = (m: any) => {
+                if (m.status === 'finished') return <span className="px-4 py-1.5 bg-zinc-200 text-zinc-600 rounded-full text-sm font-black uppercase tracking-widest">Encerrado</span>;
+                if (liveNow(m)) return <span className="px-4 py-1.5 bg-rose-500 text-white rounded-full text-sm font-black uppercase tracking-widest flex items-center gap-2"><span className="w-2 h-2 rounded-full bg-white animate-pulse" />Ao Vivo</span>;
+                return <span className="px-4 py-1.5 bg-zinc-900 text-white rounded-full text-sm font-black uppercase tracking-widest">Agendado</span>;
+              };
+              return (
+                <div className="w-full h-full bg-gradient-to-b from-white to-zinc-100 flex flex-col p-16 gap-8 relative overflow-hidden">
+                  <div className="absolute top-0 left-0 right-0 h-3 bg-adsplay" />
+                  <div className="flex items-center justify-between relative z-10">
+                    <div className="flex items-center gap-5">
+                      <div className="w-20 h-20 bg-adsplay/10 rounded-2xl flex items-center justify-center text-adsplay"><Calendar size={40} /></div>
+                      <div>
+                        <h2 className="text-7xl font-black text-zinc-900 tracking-tighter leading-none">Jogos de Hoje</h2>
+                        <p className="text-adsplay font-black uppercase tracking-[0.3em] text-lg mt-2 capitalize">{today}</p>
+                      </div>
+                    </div>
+                    <span className="text-lg font-black uppercase tracking-[0.3em] text-zinc-400">Copa FIFA 2026</span>
+                  </div>
+
+                  {loading ? (
+                    <div className="flex-1 flex items-center justify-center text-zinc-400 text-3xl font-bold">Carregando jogos de hoje...</div>
+                  ) : matches.length === 0 ? (
+                    <div className="flex-1 flex flex-col items-center justify-center gap-4">
+                      <Calendar size={90} className="text-zinc-200" />
+                      <p className="text-4xl font-black text-zinc-400">Nenhum jogo hoje</p>
+                    </div>
+                  ) : (
+                    <div className={`flex-1 grid gap-5 relative z-10 min-h-0 ${matches.length > 4 ? 'grid-cols-2 content-start' : 'grid-cols-1'}`}>
+                      {matches.slice(0, 8).map((m: any) => {
+                        const isLive = liveNow(m);
+                        const scored = wcGoal && wcGoal.id === m.id;
+                        return (
+                          <div key={m.id} className={`relative rounded-[2rem] px-8 py-6 flex items-center gap-6 border-2 shadow-sm transition-colors ${isLive ? 'bg-rose-50 border-rose-300' : 'bg-white border-zinc-200'}`}>
+                            {scored && (
+                              <motion.div
+                                initial={{ opacity: 0, scale: 0.6, y: 6 }}
+                                animate={{ opacity: 1, scale: 1, y: 0 }}
+                                transition={{ type: 'spring', stiffness: 400, damping: 18 }}
+                                className="absolute -top-4 left-1/2 -translate-x-1/2 z-20 px-5 py-2 bg-emerald-500 text-white rounded-full text-lg font-black uppercase tracking-widest shadow-lg shadow-emerald-500/30"
+                                style={{ willChange: 'transform, opacity' }}
+                              >
+                                ⚽ Gol!
+                              </motion.div>
+                            )}
+                            <div className="flex-1 flex items-center justify-end gap-4 min-w-0">
+                              <span className={`text-3xl font-black truncate text-right ${scored && wcGoal!.side === 'home' ? 'text-emerald-600' : 'text-zinc-900'}`}>{(m.home || '').toUpperCase()}</span>
+                              <TeamFlag code={m.homeCode} emoji={m.homeFlag} imgClass="w-20 h-14" emojiClass="text-6xl" />
+                            </div>
+                            <div className="flex flex-col items-center gap-2 shrink-0 min-w-[150px]">
+                              {showScore(m) ? (
+                                <span className="text-6xl font-black text-zinc-900">{m.homeScore} <span className="text-zinc-300">×</span> {m.awayScore}</span>
+                              ) : (
+                                <span className="text-4xl font-black text-zinc-300">×</span>
+                              )}
+                              {m.homePens != null && m.awayPens != null && (
+                                <span className="text-sm font-black text-emerald-600">({m.homePens}-{m.awayPens} nos pênaltis)</span>
+                              )}
+                              {badge(m)}
+                              <span className="text-sm font-black text-zinc-500">{m.time ? `${m.time} · Brasília` : 'Horário a definir'}</span>
+                            </div>
+                            <div className="flex-1 flex items-center gap-4 min-w-0">
+                              <TeamFlag code={m.awayCode} emoji={m.awayFlag} imgClass="w-20 h-14" emojiClass="text-6xl" />
+                              <span className={`text-3xl font-black truncate ${scored && wcGoal!.side === 'away' ? 'text-emerald-600' : 'text-zinc-900'}`}>{(m.away || '').toUpperCase()}</span>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+
+            {/* World Cup — knockout bracket */}
+            {currentMedia.type === 'WC_BRACKET' && (() => {
+              const rounds = wcBracket;
+              const loading = wcMatches === null;
+              const winner = (m: any) => {
+                if (!m || m.homeScore == null || m.awayScore == null) return 0;
+                if (m.homeScore > m.awayScore) return 1;
+                if (m.awayScore > m.homeScore) return 2;
+                if (m.homePens != null && m.awayPens != null) {
+                  if (m.homePens > m.awayPens) return 1;
+                  if (m.awayPens > m.homePens) return 2;
+                }
+                return 0;
+              };
+              const roundMatches = (order: number) => (rounds.find(r => knockoutOrder(r.name) === order)?.matches) || [];
+              const splitSides = (arr: any[], count: number): [any[], any[]] => {
+                const l = arr.slice(0, count); const r = arr.slice(count, count * 2);
+                while (l.length < count) l.push(null);
+                while (r.length < count) r.push(null);
+                return [l, r];
+              };
+              const [r32L, r32R] = splitSides(roundMatches(1), 8);
+              const [r16L, r16R] = splitSides(roundMatches(2), 4);
+              const [qfL, qfR] = splitSides(roundMatches(3), 2);
+              const [sfL, sfR] = splitSides(roundMatches(4), 1);
+              const finalM = roundMatches(6)[0] || null;
+              const thirdM = roundMatches(5)[0] || null;
+
+              // Flags grow round by round: fewer teams left → more emphasis.
+              const TIER: Record<string, { flag: string; score: string; size: string; pad: string; gap: string; min: string; foot: string }> = {
+                r32:   { flag: 'w-8 h-6',   score: 'text-base', size: 'w80',  pad: 'px-2 py-1.5', gap: 'gap-1.5', min: 'min-h-[3rem]',    foot: 'text-[9px]' },
+                r16:   { flag: 'w-11 h-8',  score: 'text-xl',   size: 'w160', pad: 'px-3 py-2',   gap: 'gap-2',   min: 'min-h-[3.5rem]',  foot: 'text-[10px]' },
+                qf:    { flag: 'w-14 h-10', score: 'text-2xl',  size: 'w160', pad: 'px-4 py-3',   gap: 'gap-2.5', min: 'min-h-[4.5rem]',  foot: 'text-xs' },
+                sf:    { flag: 'w-20 h-14', score: 'text-4xl',  size: 'w320', pad: 'px-5 py-4',   gap: 'gap-3',   min: 'min-h-[6rem]',    foot: 'text-sm' },
+                final: { flag: 'w-28 h-20', score: 'text-6xl',  size: 'w320', pad: 'px-6 py-6',   gap: 'gap-4',   min: 'min-h-[8rem]',    foot: 'text-base' },
+                third: { flag: 'w-14 h-10', score: 'text-2xl',  size: 'w160', pad: 'px-4 py-3',   gap: 'gap-2.5', min: 'min-h-[4.5rem]',  foot: 'text-xs' },
+              };
+              const box = (m: any, key: number, tier: string = 'r32') => {
+                const t = TIER[tier] || TIER.r32;
+                const emphasize = tier === 'sf' || tier === 'final';
+                if (!m) return <div key={key} className={`rounded-xl border border-dashed border-zinc-200 bg-zinc-50/60 ${t.min}`} />;
+                const w = winner(m);
+                const when = `${fmtBrDate(m.date)}${m.time ? ` · ${m.time}` : ''}`.trim();
+                return (
+                  <div key={key} className={`rounded-xl border bg-white ${t.pad} flex flex-col ${t.gap} shadow-sm ${emphasize ? 'border-emerald-300 shadow-emerald-900/10' : 'border-zinc-200'}`}>
+                    <div className={`flex items-center ${t.gap} ${w === 2 ? 'opacity-45' : ''}`}>
+                      <TeamFlag code={m.homeCode} emoji={m.homeFlag} size={t.size} imgClass={t.flag} emojiClass={t.score} />
+                      <span className={`${t.score} font-black ml-auto ${w === 1 ? 'text-emerald-600' : 'text-zinc-900'}`}>{m.homeScore ?? ''}{m.homePens != null ? ` (${m.homePens})` : ''}</span>
+                    </div>
+                    <div className="h-px bg-zinc-100" />
+                    <div className={`flex items-center ${t.gap} ${w === 1 ? 'opacity-45' : ''}`}>
+                      <TeamFlag code={m.awayCode} emoji={m.awayFlag} size={t.size} imgClass={t.flag} emojiClass={t.score} />
+                      <span className={`${t.score} font-black ml-auto ${w === 2 ? 'text-emerald-600' : 'text-zinc-900'}`}>{m.awayScore ?? ''}{m.awayPens != null ? ` (${m.awayPens})` : ''}</span>
+                    </div>
+                    {when && m.status !== 'finished' && (
+                      <div className={`text-center ${t.foot} font-bold text-zinc-400 pt-0.5`}>{when} · Brasília</div>
+                    )}
+                  </div>
+                );
+              };
+
+              const col = (label: string, boxes: any[], k: string, tier: string = 'r32') => (
+                <div key={k} className="flex-1 flex flex-col min-w-0">
+                  <h4 className="text-[11px] font-black text-emerald-600 uppercase tracking-widest text-center mb-3 truncate">{label}</h4>
+                  <div className="flex-1 flex flex-col justify-around gap-1.5">
+                    {boxes.map((m, i) => box(m, i, tier))}
+                  </div>
+                </div>
+              );
+
+              return (
+                <div className="w-full h-full bg-gradient-to-b from-white to-zinc-100 flex flex-col p-10 gap-5 relative overflow-hidden">
+                  <div className="absolute top-0 left-0 right-0 h-3 bg-gradient-to-r from-emerald-500 via-yellow-400 to-emerald-500" />
+                  <div className="text-center relative z-10">
+                    <h2 className="text-6xl font-black text-zinc-900 tracking-tighter leading-none">Caminho até a Final</h2>
+                    <p className="text-emerald-600 font-black uppercase tracking-[0.3em] text-sm mt-2">Copa do Mundo FIFA 2026 · Mata-Mata</p>
+                  </div>
+
+                  {loading ? (
+                    <div className="flex-1 flex items-center justify-center text-zinc-400 text-2xl font-bold">Carregando chaveamento...</div>
+                  ) : rounds.length === 0 ? (
+                    <div className="flex-1 flex flex-col items-center justify-center gap-4">
+                      <Trophy size={80} className="text-zinc-200" />
+                      <p className="text-3xl font-black text-zinc-400">Mata-mata ainda não começou</p>
+                    </div>
+                  ) : (
+                    <div className="flex-1 flex items-stretch gap-3 relative z-10 min-h-0">
+                      {col('2ª Fase', r32L, 'r32l', 'r32')}
+                      {col('Oitavas', r16L, 'r16l', 'r16')}
+                      {col('Quartas', qfL, 'qfl', 'qf')}
+                      {col('Semifinais', sfL, 'sfl', 'sf')}
+                      <div className="flex flex-col items-center justify-center gap-8 px-2 shrink-0" style={{ flexBasis: '260px' }}>
+                        {(() => {
+                          const fw = winner(finalM);
+                          if (!finalM || fw === 0) {
+                            return (
+                              <div className="w-full text-center">
+                                <h4 className="text-3xl font-black text-emerald-600 uppercase tracking-[0.2em] mb-3">Final</h4>
+                                {box(finalM, 999, 'final')}
+                              </div>
+                            );
+                          }
+                          const champName = fw === 1 ? finalM.home : finalM.away;
+                          const champCode = fw === 1 ? finalM.homeCode : finalM.awayCode;
+                          return (
+                            <div className="w-full text-center flex flex-col items-center gap-3">
+                              <div className="text-5xl">🏆</div>
+                              <h4 className="text-2xl font-black text-yellow-500 uppercase tracking-[0.25em]">Campeão do Mundo</h4>
+                              <TeamFlag code={champCode} imgClass="w-40 h-28" emojiClass="text-8xl" />
+                              <p className="text-4xl font-black text-zinc-900 tracking-tighter">{(champName || '').toUpperCase()}</p>
+                              <p className="text-sm font-black text-zinc-400 uppercase tracking-[0.3em]">FIFA 2026</p>
+                            </div>
+                          );
+                        })()}
+                        <div className="w-full text-center">
+                          <h4 className="text-xs font-black text-zinc-400 uppercase tracking-widest mb-1">Disputa do 3º Lugar</h4>
+                          {box(thirdM, 998, 'third')}
+                        </div>
+                      </div>
+                      {col('Semifinais', sfR, 'sfr', 'sf')}
+                      {col('Quartas', qfR, 'qfr', 'qf')}
+                      {col('Oitavas', r16R, 'r16r', 'r16')}
+                      {col('2ª Fase', r32R, 'r32r', 'r32')}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+
+            {/* World Cup — ranking by titles (stars) */}
+            {currentMedia.type === 'WC_RANKING' && (() => {
+              const ranking = (Array.isArray(currentMedia.payload?.ranking) ? currentMedia.payload.ranking : [])
+                .slice().sort((a: any, b: any) => (Number(b.titles) || 0) - (Number(a.titles) || 0));
+              const maxT = ranking.reduce((m: number, r: any) => Math.max(m, Number(r.titles) || 0), 0);
+              return (
+                <div className="w-full h-full bg-gradient-to-b from-white to-zinc-100 flex flex-col items-center justify-center relative overflow-hidden" style={{ padding: '7vh 8vw' }}>
+                  <div className="absolute top-0 left-0 right-0 h-3 bg-gradient-to-r from-yellow-400 via-amber-500 to-yellow-400" />
+                  <div className="w-full max-w-4xl flex flex-col gap-6 relative z-10 min-h-0">
+                    <div className="flex items-center gap-4 justify-center text-center">
+                      <div className="w-14 h-14 bg-yellow-400/15 rounded-2xl flex items-center justify-center text-yellow-500 shrink-0"><Trophy size={28} /></div>
+                      <div>
+                        <h2 className="text-5xl font-black text-zinc-900 tracking-tighter leading-none">Maiores Campeões</h2>
+                        <p className="text-amber-600 font-black uppercase tracking-[0.3em] text-xs mt-1.5">Copa do Mundo FIFA · Títulos por Seleção</p>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-col gap-2">
+                      {ranking.length === 0 ? (
+                        <div className="py-16 text-center text-zinc-400 text-2xl font-bold">Nenhuma seleção cadastrada</div>
+                      ) : ranking.slice(0, 8).map((r: any, i: number) => {
+                        const titles = Number(r.titles) || 0;
+                        const top = titles === maxT;
+                        return (
+                          <div key={i} className={`rounded-2xl px-6 py-3 flex items-center gap-5 border shadow-sm ${top ? 'bg-yellow-50 border-yellow-300' : 'bg-white border-zinc-200'}`}>
+                            <span className={`text-2xl font-black w-9 text-center shrink-0 ${top ? 'text-amber-500' : 'text-zinc-300'}`}>{i + 1}</span>
+                            <TeamFlag code={r.code} emoji={r.flag} imgClass="w-14 h-10" emojiClass="text-4xl" />
+                            <span className="text-3xl font-black text-zinc-900 flex-1 truncate">{r.team}</span>
+                            <span className="text-xl tracking-tight shrink-0 whitespace-nowrap hidden md:inline">{'⭐'.repeat(Math.min(titles, 6))}</span>
+                            <span className="text-2xl font-black text-zinc-900 w-32 text-right shrink-0">{titles} {titles === 1 ? 'título' : 'títulos'}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+
+              </>
             )}
+            </CardBoundary>
 
             {/* Overlay Info (Legacy - Hidden by Top Bar but kept for safety if needed) */}
             <div className="absolute top-10 right-10 flex items-center gap-4 opacity-0 pointer-events-none">
@@ -1995,6 +2935,7 @@ export function Player() {
           </motion.div>
         )}
       </AnimatePresence>
+      </div>
 
       {/* Progress Bar - Moved outside AnimatePresence for smoother transitions */}
       {playlist && playlist.items[currentIndex] && status === 'PLAYING' && (

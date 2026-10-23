@@ -12,7 +12,6 @@
   },
   "dependencies": {
     "@google/genai": "^1.45.0",
-    "@vitejs/plugin-legacy": "^8.0.0",
     "browser-image-compression": "^2.0.2",
     "clsx": "^2.1.1",
     "core-js": "^3.48.0",
@@ -22,6 +21,7 @@
     "qrcode.react": "^4.2.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
+    "react-is": "^19.2.6",
     "react-router-dom": "^7.13.1",
     "recharts": "^3.8.0",
     "regenerator-runtime": "^0.14.1",

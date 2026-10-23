@@ -51,7 +51,7 @@ service cloud.firestore {
     function isValidMedia(data) {
       return data.keys().hasAll(['title', 'type', 'payload']) &&
              data.title is string && data.title.size() > 0 && data.title.size() < 200 &&
-             data.type in ['IMAGE_HERO', 'VIDEO_FILE', 'YOUTUBE', 'DASHBOARD', 'INSTAGRAM', 'MONTHLY_GOAL', 'CAROUSEL', 'NEWS_CLIPPING', 'WEATHER', 'NORTH_STAR'] &&
+             data.type in ['IMAGE_HERO', 'VIDEO_FILE', 'YOUTUBE', 'DASHBOARD', 'INSTAGRAM', 'MONTHLY_GOAL', 'CAROUSEL', 'NEWS_CLIPPING', 'WEATHER', 'NORTH_STAR', 'WEBSITE_EMBED', 'FINAL_SPRINT', 'SMART_SALES', 'WC_BRAZIL', 'WC_TODAY', 'WC_BRACKET', 'WC_RANKING'] &&
              data.payload is map &&
              (!('company' in data) || data.company in ['Adsplay', 'Mootag', 'Geral']) &&
              data.keys().hasOnly(['title', 'type', 'payload', 'company', 'createdAt', 'updatedAt']);
@@ -84,7 +84,7 @@ service cloud.firestore {
       return data.keys().hasAll(['email', 'role']) &&
              data.email is string &&
              data.role in ['SUPER_ADMIN', 'ADMIN', 'CONTENT_MANAGER'] &&
-             data.keys().hasOnly(['email', 'role', 'displayName', 'photoURL', 'createdAt', 'updatedAt']);
+             data.keys().hasOnly(['email', 'role', 'displayName', 'photoURL', 'createdAt', 'updatedAt', 'status', 'password']);
     }
 
     function isNewsUpdateOnly(newData, oldData) {
@@ -99,13 +99,22 @@ service cloud.firestore {
              oldData.type == 'WEATHER';
     }
 
+    // World Cup cards let the public player refresh their cached match data
+    // (payload) via Gemini. Only the payload/updatedAt may change, and only on
+    // an existing World Cup media doc.
+    function isWorldCupUpdateOnly(newData, oldData) {
+      return newData.diff(oldData).affectedKeys().hasOnly(['payload', 'updatedAt']) &&
+             oldData.type in ['WC_BRAZIL', 'WC_TODAY', 'WC_BRACKET'];
+    }
+
     // Rules
     match /media/{mediaId} {
       allow read: if true; // Public for player
       allow create: if isContentManager() && isValidMedia(request.resource.data);
-      allow update: if (isContentManager() && isValidMedia(request.resource.data)) || 
+      allow update: if (isContentManager() && isValidMedia(request.resource.data)) ||
                        isNewsUpdateOnly(request.resource.data, resource.data) ||
-                       isWeatherUpdateOnly(request.resource.data, resource.data);
+                       isWeatherUpdateOnly(request.resource.data, resource.data) ||
+                       isWorldCupUpdateOnly(request.resource.data, resource.data);
       allow delete: if isContentManager();
     }
 
@@ -130,34 +139,61 @@ service cloud.firestore {
 
     match /users/{userId} {
       allow read: if isAuthenticated() && (
-        request.auth.uid == userId || 
-        isSuperAdmin() || 
+        request.auth.uid == userId ||
+        isAdmin() ||
         (resource != null && resource.data.email.lower() == request.auth.token.email.lower())
       );
-      
+
       allow create: if isAuthenticated() && isValidUser(request.resource.data) && (
-        isSuperAdmin() || 
+        isAdmin() ||
+        (request.auth.uid == userId && request.auth.token.email.lower() == "bruno@adsplay.com.br")
+      );
+
+      allow update: if isAuthenticated() && (
+        (isAdmin() && isValidUser(request.resource.data)) ||
         (request.auth.uid == userId && (
-          (request.auth.token.email.lower() == "bruno@adsplay.com.br") ||
-          exists(/databases/$(database)/documents/users/invite_ + request.auth.token.email.lower())
+          (isValidUser(request.resource.data) && request.resource.data.role == resource.data.role) ||
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt'])
         ))
       );
 
-      allow update: if isAuthenticated() && isValidUser(request.resource.data) && (
-        isSuperAdmin() || 
-        (request.auth.uid == userId && request.resource.data.role == resource.data.role)
-      );
-
-      allow delete: if isSuperAdmin() || (
-        isAuthenticated() && 
-        userId == "invite_" + request.auth.token.email.lower()
-      );
+      allow delete: if isAdmin();
     }
 
     match /library/{libraryId} {
       allow read: if isAuthenticated();
       allow create: if isContentManager();
       allow delete: if isContentManager() && resource.data.uploadedBy == request.auth.uid;
+    }
+
+    // Smart Media — Sales feed. Written ONLY by the Apps Script ingestion
+    // (service account via REST, which bypasses these rules). Clients can read
+    // (public, for the TV player) but never write — prevents spam from the browser.
+    match /sales/{saleId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // World Cup — single source of truth for matches. Content managers seed and
+    // edit (import base results, corrections). The public player may READ, and
+    // may UPDATE only the live fields of a NON-finished match (so the TV can
+    // reflect live scores) — it can never rewrite a finished result, change the
+    // teams/date, or create/delete matches.
+    match /wc_matches/{matchId} {
+      allow read: if true;
+      allow create: if isContentManager();
+      allow update: if isContentManager() ||
+                       (resource.data.status != 'finished' &&
+                        request.resource.data.diff(resource.data).affectedKeys()
+                          .hasOnly(['homeScore', 'awayScore', 'homePens', 'awayPens', 'status', 'time', 'updatedAt']));
+      allow delete: if isContentManager();
+    }
+
+    // Player control channel. Public read (TVs listen for a reload command);
+    // only admins can write (e.g. "Atualizar TVs" to push a new deploy).
+    match /config/{docId} {
+      allow read: if true;
+      allow write: if isAdmin();
     }
   }
 }

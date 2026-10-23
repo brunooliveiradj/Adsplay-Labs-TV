@@ -1,14 +1,15 @@
 import React, { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Plus, Image as ImageIcon, Video, Youtube, Layout, Trash2, Edit2, Instagram, Upload, Loader2, BarChart3, AlertCircle, Layers, X as XIcon, Newspaper, CloudSun, Star, MapPin, TrendingUp, Globe, HardDrive, CheckCircle2 } from 'lucide-react';
+import { Plus, Image as ImageIcon, Video, Youtube, Layout, Trash2, Edit2, Instagram, Upload, Loader2, BarChart3, AlertCircle, Layers, X as XIcon, Newspaper, CloudSun, Star, MapPin, TrendingUp, Globe, HardDrive, CheckCircle2, Zap, Trophy, Flag, Calendar } from 'lucide-react';
 import { auth, db, storage, handleFirestoreError, OperationType } from '../firebase';
 import { ref, uploadBytesResumable, getDownloadURL, getMetadata } from 'firebase/storage';
-import { collection, getDocs, addDoc, deleteDoc, doc, updateDoc, serverTimestamp, query, orderBy } from 'firebase/firestore';
+import { collection, getDocs, addDoc, deleteDoc, doc, setDoc, updateDoc, serverTimestamp, query, orderBy } from 'firebase/firestore';
 import { Company } from '../types';
 import { GoogleGenAI } from "@google/genai";
+import { parseBaseImport, parseLooseJson, fetchWcPendingUpdates, fetchBrazilCampaign, matchDocId, matchupKey, WCMatch } from '../lib/worldcup';
 import imageCompression from 'browser-image-compression';
 
-type MediaType = 'IMAGE_HERO' | 'VIDEO_FILE' | 'YOUTUBE' | 'DASHBOARD' | 'INSTAGRAM' | 'MONTHLY_GOAL' | 'CAROUSEL' | 'NEWS_CLIPPING' | 'WEATHER' | 'NORTH_STAR' | 'WEBSITE_EMBED';
+type MediaType = 'IMAGE_HERO' | 'VIDEO_FILE' | 'YOUTUBE' | 'DASHBOARD' | 'INSTAGRAM' | 'MONTHLY_GOAL' | 'CAROUSEL' | 'NEWS_CLIPPING' | 'WEATHER' | 'NORTH_STAR' | 'WEBSITE_EMBED' | 'FINAL_SPRINT' | 'SMART_SALES' | 'WC_BRAZIL' | 'WC_TODAY' | 'WC_BRACKET' | 'WC_RANKING';
 
 interface Media {
   id: string;
@@ -39,6 +40,11 @@ export function Media() {
 
   const [isSyncingWeather, setIsSyncingWeather] = useState(false);
   const [isSyncingNews, setIsSyncingNews] = useState<number | null>(null);
+  // World Cup — shared match collection management
+  const [wcMatches, setWcMatches] = useState<WCMatch[]>([]);
+  const [wcImportText, setWcImportText] = useState('');
+  const [wcBusy, setWcBusy] = useState<string | null>(null); // 'load' | 'import' | 'sync' | 'save'
+  const [wcMsg, setWcMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [isLibraryOpen, setIsLibraryOpen] = useState(false);
   const [libraryItems, setLibraryItems] = useState<any[]>([]);
   const [libraryTarget, setLibraryTarget] = useState<'single' | 'carousel' | 'playlist_logo'>('single');
@@ -174,6 +180,161 @@ export function Media() {
     }
   };
 
+  // Pull fresh World Cup data via IA into the form for review/editing (hybrid).
+  // --- World Cup: shared `wc_matches` collection (single source of truth) ----
+  const wcDocData = (m: WCMatch) => {
+    const data: any = {
+      date: m.date || '', time: m.time || '', stage: m.stage || '',
+      home: m.home, away: m.away, homeCode: m.homeCode || '', awayCode: m.awayCode || '',
+      homeScore: m.homeScore ?? null, awayScore: m.awayScore ?? null,
+      homePens: m.homePens ?? null, awayPens: m.awayPens ?? null,
+      status: m.status || 'scheduled', updatedAt: serverTimestamp(),
+    };
+    // Only write bracket order when known, so IA merges don't wipe it.
+    if (typeof m.order === 'number' && !isNaN(m.order)) data.order = m.order;
+    return data;
+  };
+
+  const loadWcMatches = async () => {
+    setWcBusy('load');
+    try {
+      const snap = await getDocs(collection(db, 'wc_matches'));
+      const list = snap.docs.map(d => Object.assign({ id: d.id }, d.data()) as WCMatch);
+      list.sort((a, b) => `${a.date || ''} ${a.time || ''}`.localeCompare(`${b.date || ''} ${b.time || ''}`));
+      setWcMatches(list);
+    } catch (e) {
+      handleFirestoreError(e, OperationType.LIST, 'wc_matches');
+    } finally {
+      setWcBusy(null);
+    }
+  };
+
+  // Import/upsert base results (played games are fixed data). Idempotent by id.
+  const importWcBase = async () => {
+    setWcMsg(null);
+    if (!parseLooseJson(wcImportText)) {
+      setWcMsg({ ok: false, text: 'JSON malformado (erro de sintaxe). Verifique se colou o texto completo.' });
+      return;
+    }
+    const parsed = parseBaseImport(wcImportText);
+    if (parsed.length === 0) {
+      setWcMsg({ ok: false, text: 'JSON lido, mas nenhum jogo reconhecido. O array precisa ter jogos com "equipe_casa"/"equipe_visitante".' });
+      return;
+    }
+    setWcBusy('import');
+    try {
+      await Promise.all(parsed.map(m => setDoc(doc(db, 'wc_matches', m.id!), wcDocData(m), { merge: true })));
+      setWcImportText('');
+      await loadWcMatches();
+      setWcMsg({ ok: true, text: `✅ ${parsed.length} jogo(s) importado(s) com sucesso.` });
+    } catch (e: any) {
+      console.error('WC import error:', e);
+      setWcMsg({ ok: false, text: `Erro ao gravar no banco: ${e?.message || 'verifique permissões (regras do Firestore)'}` });
+    } finally {
+      setWcBusy(null);
+    }
+  };
+
+  // IA updates ONLY pending/future games; never rewrites a finished result.
+  const syncWcPending = async () => {
+    const pending = wcMatches.filter(m => m.status !== 'finished');
+    setWcBusy('sync');
+    setWcMsg(null);
+    try {
+      const updates = await fetchWcPendingUpdates(pending);
+      if (updates.length === 0) { setWcMsg({ ok: false, text: 'A IA não retornou atualizações. Tente novamente.' }); }
+      let applied = 0;
+      await Promise.all(updates.map(u => {
+        const existing = wcMatches.find(m => matchupKey(m) === matchupKey(u));
+        if (existing && existing.status === 'finished') return Promise.resolve(); // never rewrite finished
+        applied++;
+        const id = existing?.id || u.id || matchDocId(u);
+        return setDoc(doc(db, 'wc_matches', id), wcDocData({
+          ...u,
+          order: u.order ?? existing?.order,
+          date: u.date || existing?.date, time: u.time || existing?.time, stage: u.stage || existing?.stage,
+          homeCode: u.homeCode || existing?.homeCode, awayCode: u.awayCode || existing?.awayCode,
+        }), { merge: true });
+      }));
+      await loadWcMatches();
+      if (updates.length > 0) setWcMsg({ ok: true, text: `✅ ${applied} jogo(s) pendente(s) atualizado(s) pela IA.` });
+    } catch (e: any) {
+      console.error('WC pending sync error:', e);
+      setWcMsg({ ok: false, text: `Erro ao sincronizar pendentes: ${e?.message || 'tente novamente'}` });
+    } finally {
+      setWcBusy(null);
+    }
+  };
+
+  // One-click: fetch Brazil's full campaign via IA and upsert it, so the
+  // trajectory is complete even if the imported base was missing games.
+  const syncBrazil = async () => {
+    setWcBusy('brazil');
+    setWcMsg(null);
+    try {
+      const games = await fetchBrazilCampaign();
+      if (games.length === 0) { setWcMsg({ ok: false, text: 'A IA não retornou jogos do Brasil. Tente novamente.' }); return; }
+      await Promise.all(games.map(m => {
+        const existing = wcMatches.find(x => matchupKey(x) === matchupKey(m));
+        const id = existing?.id || m.id!;
+        return setDoc(doc(db, 'wc_matches', id), wcDocData({ ...m, order: m.order ?? existing?.order }), { merge: true });
+      }));
+      await loadWcMatches();
+      setWcMsg({ ok: true, text: `✅ Trajetória do Brasil sincronizada (${games.length} jogo(s)).` });
+    } catch (e: any) {
+      console.error('Brazil sync error:', e);
+      setWcMsg({ ok: false, text: `Erro ao sincronizar Brasil: ${e?.message || 'tente novamente'}` });
+    } finally {
+      setWcBusy(null);
+    }
+  };
+
+  const updateWcRow = (id: string, patch: Partial<WCMatch>) => {
+    setWcMatches(prev => prev.map(m => (m.id === id ? { ...m, ...patch } : m)));
+  };
+
+  const saveWcRow = async (m: WCMatch) => {
+    setWcBusy('save');
+    try {
+      await setDoc(doc(db, 'wc_matches', m.id!), wcDocData(m), { merge: true });
+    } catch (e) {
+      handleFirestoreError(e, OperationType.WRITE, `wc_matches/${m.id}`);
+    } finally {
+      setWcBusy(null);
+    }
+  };
+
+  const deleteWcRow = async (id: string) => {
+    setWcBusy('save');
+    try {
+      await deleteDoc(doc(db, 'wc_matches', id));
+      await loadWcMatches();
+    } catch (e) {
+      handleFirestoreError(e, OperationType.DELETE, `wc_matches/${id}`);
+    } finally {
+      setWcBusy(null);
+    }
+  };
+
+  // Wipe the whole shared collection so you can reimport a clean, single base
+  // (avoids duplicates left by earlier imports with different name spellings).
+  const clearWcBase = async () => {
+    if (!window.confirm('Apagar TODOS os jogos da base da Copa? A coleção será limpa e você poderá reimportar em seguida.')) return;
+    setWcBusy('clear');
+    setWcMsg(null);
+    try {
+      const snap = await getDocs(collection(db, 'wc_matches'));
+      await Promise.all(snap.docs.map(d => deleteDoc(doc(db, 'wc_matches', d.id))));
+      await loadWcMatches();
+      setWcMsg({ ok: true, text: '🧹 Base limpa. Agora cole o JSON definitivo e clique em Importar.' });
+    } catch (e: any) {
+      console.error('WC clear error:', e);
+      setWcMsg({ ok: false, text: `Erro ao limpar a base: ${e?.message || 'tente novamente'}` });
+    } finally {
+      setWcBusy(null);
+    }
+  };
+
   const fetchMedia = async () => {
     try {
       const q = query(collection(db, 'media'), orderBy('createdAt', 'desc'));
@@ -188,6 +349,14 @@ export function Media() {
   useEffect(() => {
     fetchMedia();
   }, []);
+
+  // Load the shared World Cup matches whenever a WC card is being edited.
+  useEffect(() => {
+    if (isModalOpen && (type === 'WC_BRAZIL' || type === 'WC_TODAY' || type === 'WC_BRACKET')) {
+      loadWcMatches();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isModalOpen, type]);
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -215,25 +384,33 @@ export function Media() {
       const uploadTask = uploadBytesResumable(storageRef, fileToUpload);
 
       await new Promise<void>((resolve, reject) => {
-        uploadTask.on('state_changed', 
+        const timeout = setTimeout(() => {
+          uploadTask.cancel();
+          reject(new Error('Upload expirou. Verifique sua conexão ou as permissões do Firebase Storage.'));
+        }, 60000);
+
+        uploadTask.on('state_changed',
           (snapshot) => {
             const progress = snapshot.totalBytes > 0 ? (snapshot.bytesTransferred / snapshot.totalBytes) * 100 : 0;
             setUploadProgress(Math.round(progress));
           },
           (err: any) => {
-            console.error('Upload error:', err);
+            clearTimeout(timeout);
+            console.error('Upload error:', err.code, err.message);
             if (err.code === 'storage/unauthorized') {
-              reject(new Error('Sem permissão para salvar. Verifique se você é administrador.'));
+              reject(new Error('Sem permissão. Verifique as Storage Rules no Firebase Console.'));
+            } else if (err.code === 'storage/canceled') {
+              reject(new Error('Upload cancelado por timeout. Tente novamente.'));
             } else {
-              reject(err);
+              reject(new Error(`Erro no upload: ${err.code || err.message}`));
             }
           },
           async () => {
+            clearTimeout(timeout);
             try {
               const url = await getDownloadURL(uploadTask.snapshot.ref);
               const meta = await getMetadata(uploadTask.snapshot.ref);
-              
-              // Also save to library
+
               await addDoc(collection(db, 'library'), {
                 name: file.name,
                 url,
@@ -243,7 +420,7 @@ export function Media() {
                 createdAt: serverTimestamp(),
                 uploadedBy: auth.currentUser?.uid
               });
-              
+
               setPayload(prev => ({ ...prev, url }));
               resolve();
             } catch (err) {
@@ -296,26 +473,32 @@ export function Media() {
         const uploadTask = uploadBytesResumable(storageRef, file);
 
         await new Promise<void>((resolve, reject) => {
-          uploadTask.on('state_changed', 
+          const timeout = setTimeout(() => {
+            uploadTask.cancel();
+            reject(new Error(`Upload de "${file.name}" expirou. Verifique as Storage Rules no Firebase Console.`));
+          }, 60000);
+
+          uploadTask.on('state_changed',
             (snapshot) => {
               const fileProgress = snapshot.totalBytes > 0 ? (snapshot.bytesTransferred / snapshot.totalBytes) * 100 : 0;
               const overallProgress = ((i / files.length) * 100) + (fileProgress / files.length);
               setUploadProgress(Math.round(overallProgress));
             },
             (err: any) => {
-              console.error('Upload error:', err);
+              clearTimeout(timeout);
+              console.error('Upload error:', err.code, err.message);
               if (err.code === 'storage/unauthorized') {
-                reject(new Error(`Sem permissão para "${file.name}".`));
+                reject(new Error(`Sem permissão para "${file.name}". Verifique as Storage Rules no Firebase Console.`));
               } else {
-                reject(err);
+                reject(new Error(`Erro no upload de "${file.name}": ${err.code || err.message}`));
               }
             },
             async () => {
+              clearTimeout(timeout);
               try {
                 const url = await getDownloadURL(uploadTask.snapshot.ref);
                 const meta = await getMetadata(uploadTask.snapshot.ref);
-                
-                // Save to library
+
                 await addDoc(collection(db, 'library'), {
                   name: file.name,
                   url,
@@ -372,6 +555,24 @@ export function Media() {
     }
     if (type === 'CAROUSEL' && !finalPayload.images) {
       finalPayload.images = [];
+    }
+
+    // NORTH_STAR: snapshot the previous metric values whenever any of them
+    // changes, so the TV can show the % variation vs. the last update.
+    if (type === 'NORTH_STAR' && editingId) {
+      const stored = mediaList.find(m => m.id === editingId)?.payload || {};
+      const keys = ['adsplay', 'pixel', 'trigger', 'adsmax'] as const;
+      const changed = keys.some(k => (Number(stored[k]) || 0) !== (Number(finalPayload[k]) || 0));
+      if (changed) {
+        finalPayload.prevMetrics = {
+          adsplay: Number(stored.adsplay) || 0,
+          pixel: Number(stored.pixel) || 0,
+          trigger: Number(stored.trigger) || 0,
+          adsmax: Number(stored.adsmax) || 0,
+        };
+        finalPayload.prevUpdatedAt = Date.now();
+      }
+      // unchanged → keep the existing prevMetrics already in the payload
     }
 
     if (type === 'NEWS_CLIPPING' && (!finalPayload.newsItems || finalPayload.newsItems.length === 0)) {
@@ -463,6 +664,12 @@ export function Media() {
       case 'WEATHER': return <CloudSun size={20} />;
       case 'NORTH_STAR': return <Star size={20} />;
       case 'WEBSITE_EMBED': return <Globe size={20} />;
+      case 'FINAL_SPRINT': return <Zap size={20} />;
+      case 'SMART_SALES': return <Trophy size={20} />;
+      case 'WC_BRAZIL': return <Flag size={20} />;
+      case 'WC_TODAY': return <Calendar size={20} />;
+      case 'WC_BRACKET': return <Trophy size={20} />;
+      case 'WC_RANKING': return <Star size={20} />;
     }
   };
 
@@ -623,18 +830,18 @@ export function Media() {
                   <div>
                     <p className="text-xs font-bold text-white">North Star Metric</p>
                     <p className="text-[24px] font-black text-white mt-1">
-                      {((item.payload.adsplay || 0) + (item.payload.pixel || 0) + (item.payload.trigger || 0) + (item.payload.adsmax || 0))} / 1000
+                      {((item.payload.adsplay || 0) + (item.payload.pixel || 0) + (item.payload.trigger || 0) + (item.payload.adsmax || 0))}
                     </p>
                     <p className="text-[10px] font-black text-zinc-500 uppercase tracking-widest">
-                      Campanhas Ativas
+                      Core + New · Campanhas
                     </p>
                   </div>
                 </div>
               )}
               {item.type === 'WEBSITE_EMBED' && (
                 <div className="w-full h-full relative group">
-                  <img 
-                    src={item.payload.screenshotUrl} 
+                  <img
+                    src={item.payload.screenshotUrl}
                     className="w-full h-full object-cover"
                     alt={item.title}
                     referrerPolicy="no-referrer"
@@ -644,6 +851,85 @@ export function Media() {
                     <p className="text-xs font-bold text-white truncate w-full">{item.payload.url}</p>
                     <p className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mt-1">Website Embed</p>
                   </div>
+                </div>
+              )}
+              {item.type === 'FINAL_SPRINT' && (
+                <div className="w-full h-full flex flex-col items-center justify-center bg-zinc-950 p-6 space-y-3 relative overflow-hidden">
+                  <div className="absolute inset-0 bg-violet-900/20 blur-[60px] rounded-full" />
+                  <motion.span
+                    animate={{ y: [0, -6, 0], rotate: [-8, 8, -8] }}
+                    transition={{ duration: 1, repeat: Infinity }}
+                    className="text-4xl relative z-10"
+                    style={{ filter: 'drop-shadow(0 0 12px rgba(168,85,247,0.8))' }}
+                  >
+                    🦙
+                  </motion.span>
+                  {(() => {
+                    const fmt = (n: number) => `R$ ${n.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+                    const remaining = Math.max(0, (item.payload.target || 100) - (item.payload.current || 0));
+                    const pct = Math.min(100, Math.round(((item.payload.current || 0) / (item.payload.target || 1)) * 100));
+                    return (
+                      <>
+                        <div className="text-center relative z-10">
+                          <p className="text-[10px] font-black text-zinc-500 uppercase tracking-widest">Sprint Final</p>
+                          <p className="text-lg font-black text-white mt-1 leading-tight">{fmt(remaining)}</p>
+                          <p className="text-[9px] font-bold text-zinc-500">{item.payload.label || 'vendas'} faltam</p>
+                        </div>
+                        <div className="w-full relative z-10 space-y-1">
+                          <div className="w-full h-2 bg-zinc-800 rounded-full overflow-hidden">
+                            <div
+                              className="h-full bg-gradient-to-r from-adsplay to-violet-400 rounded-full"
+                              style={{ width: `${pct}%` }}
+                            />
+                          </div>
+                          <p className="text-[8px] font-black text-zinc-600 uppercase tracking-widest text-center">
+                            {fmt(item.payload.current || 0)} / {fmt(item.payload.target || 0)}
+                          </p>
+                        </div>
+                      </>
+                    );
+                  })()}
+                </div>
+              )}
+              {item.type === 'SMART_SALES' && (
+                <div className="w-full h-full flex flex-col items-center justify-center bg-zinc-950 p-6 space-y-2 relative overflow-hidden">
+                  <div className="absolute inset-0 bg-emerald-900/20 blur-[60px] rounded-full" />
+                  <Trophy size={36} className="text-emerald-400 relative z-10" style={{ filter: 'drop-shadow(0 0 12px rgba(16,185,129,0.7))' }} />
+                  <div className="text-center relative z-10">
+                    <p className="text-[10px] font-black text-zinc-500 uppercase tracking-widest">Smart Media</p>
+                    <p className="text-base font-black text-white mt-0.5">Vendas em tempo real</p>
+                    <p className="text-[9px] font-bold text-zinc-500 mt-1">
+                      {(item.payload.scope || 'latest') === 'month' ? 'Mês atual' : 'Últimas 5'} · entradadecampanha@
+                    </p>
+                  </div>
+                </div>
+              )}
+              {item.type === 'WC_BRAZIL' && (
+                <div className="w-full h-full flex flex-col items-center justify-center bg-gradient-to-br from-[#00401f] to-[#0a0a0a] p-6 space-y-2 text-center">
+                  <span className="text-4xl">🇧🇷</span>
+                  <p className="text-sm font-black text-white leading-tight">Seleção Brasileira</p>
+                  <p className="text-[9px] font-bold text-yellow-400 uppercase tracking-widest">Trajetória + próximo jogo</p>
+                </div>
+              )}
+              {item.type === 'WC_TODAY' && (
+                <div className="w-full h-full flex flex-col items-center justify-center bg-gradient-to-br from-[#0a0f2c] to-[#050505] p-6 space-y-2 text-center">
+                  <Calendar size={32} className="text-adsplay" />
+                  <p className="text-sm font-black text-white leading-tight">Jogos de Hoje</p>
+                  <p className="text-[9px] font-bold text-zinc-500 uppercase tracking-widest">Copa 2026</p>
+                </div>
+              )}
+              {item.type === 'WC_BRACKET' && (
+                <div className="w-full h-full flex flex-col items-center justify-center bg-gradient-to-br from-[#1a0a2e] to-[#050505] p-6 space-y-2 text-center">
+                  <Trophy size={32} className="text-yellow-400" />
+                  <p className="text-sm font-black text-white leading-tight">Mata-Mata</p>
+                  <p className="text-[9px] font-bold text-zinc-500 uppercase tracking-widest">Chaveamento · Copa 2026</p>
+                </div>
+              )}
+              {item.type === 'WC_RANKING' && (
+                <div className="w-full h-full flex flex-col items-center justify-center bg-gradient-to-br from-[#1a1400] to-[#0a0a0a] p-6 space-y-2 text-center">
+                  <Star size={32} className="text-yellow-400" style={{ filter: 'drop-shadow(0 0 10px rgba(250,204,21,0.6))' }} />
+                  <p className="text-sm font-black text-white leading-tight">Ranking por Títulos</p>
+                  <p className="text-[9px] font-bold text-zinc-500 uppercase tracking-widest">{(item.payload.ranking || []).length} seleções · estrelas</p>
                 </div>
               )}
               <div className="absolute top-3 left-3 bg-black/50 backdrop-blur-md text-white p-2 rounded-lg">
@@ -760,7 +1046,7 @@ export function Media() {
 
                 <div className="p-8 pt-6 flex-1 overflow-y-auto custom-scrollbar space-y-8">
                   <div className="grid grid-cols-10 gap-2">
-                    {(['IMAGE_HERO', 'VIDEO_FILE', 'YOUTUBE', 'DASHBOARD', 'INSTAGRAM', 'MONTHLY_GOAL', 'CAROUSEL', 'NEWS_CLIPPING', 'WEATHER', 'NORTH_STAR', 'WEBSITE_EMBED'] as MediaType[]).map((t) => (
+                    {(['IMAGE_HERO', 'VIDEO_FILE', 'YOUTUBE', 'DASHBOARD', 'INSTAGRAM', 'MONTHLY_GOAL', 'CAROUSEL', 'NEWS_CLIPPING', 'WEATHER', 'NORTH_STAR', 'WEBSITE_EMBED', 'FINAL_SPRINT', 'SMART_SALES', 'WC_BRAZIL', 'WC_TODAY', 'WC_BRACKET', 'WC_RANKING'] as MediaType[]).map((t) => (
                       <button
                         key={t}
                         type="button"
@@ -792,8 +1078,29 @@ export function Media() {
                               ]
                             });
                           }
-                          if (t === 'NORTH_STAR' && !payload.adsplay) {
-                            setPayload({ ...payload, adsplay: 0, pixel: 0, trigger: 0, adsmax: 0 });
+                          if (t === 'NORTH_STAR' && payload.metaCoreGoal === undefined) {
+                            setPayload({ ...payload, adsplay: 0, pixel: 0, trigger: 0, adsmax: 0, metaCoreGoal: 150, metaPixelGoal: 500 });
+                          }
+                          if (t === 'FINAL_SPRINT') {
+                            setPayload({ target: 100, current: 0, label: 'vendas', month: '', teamName: '' });
+                          }
+                          if (t === 'SMART_SALES') {
+                            setPayload({ valueDisplay: 'full', scope: 'latest' });
+                          }
+                          if ((t === 'WC_BRAZIL' || t === 'WC_TODAY' || t === 'WC_BRACKET') && payload.autoRefresh === undefined) {
+                            setPayload({ autoRefresh: true });
+                          }
+                          if (t === 'WC_RANKING' && !payload.ranking) {
+                            setPayload({ ranking: [
+                              { team: 'Brasil', code: 'br', titles: 5 },
+                              { team: 'Alemanha', code: 'de', titles: 4 },
+                              { team: 'Itália', code: 'it', titles: 4 },
+                              { team: 'Argentina', code: 'ar', titles: 3 },
+                              { team: 'Espanha', code: 'es', titles: 2 },
+                              { team: 'França', code: 'fr', titles: 2 },
+                              { team: 'Uruguai', code: 'uy', titles: 2 },
+                              { team: 'Inglaterra', code: 'gb-eng', titles: 1 },
+                            ] });
                           }
                         }}
                         className={`p-3 rounded-2xl border-2 transition-all flex flex-col items-center gap-2 ${
@@ -801,7 +1108,7 @@ export function Media() {
                         }`}
                       >
                         {getIcon(t)}
-                        <span className="text-[7px] font-bold uppercase tracking-widest">{t.split('_')[0]}</span>
+                        <span className="text-[7px] font-bold uppercase tracking-widest">{t === 'WC_BRAZIL' ? 'WC BRASIL' : t === 'WC_TODAY' ? 'WC HOJE' : t === 'WC_BRACKET' ? 'WC CHAVE' : t === 'WC_RANKING' ? 'WC RANKING' : t.split('_')[0]}</span>
                       </button>
                     ))}
                   </div>
@@ -1489,26 +1796,75 @@ export function Media() {
                     </div>
                   )}
 
-                  {type === 'NORTH_STAR' && (
+                  {type === 'NORTH_STAR' && (() => {
+                    const fieldCls = "w-full px-4 py-3 bg-zinc-50 border border-zinc-200 rounded-2xl focus:outline-none focus:ring-2 focus:ring-zinc-900/10 transition-all font-bold";
+                    const numField = (label: string, key: string, def: number) => (
+                      <div className="space-y-1.5">
+                        <label className="text-xs font-bold text-zinc-500 uppercase tracking-widest">{label}</label>
+                        <input required type="number" value={Number(payload[key]) || def} onChange={(e) => setPayload({ ...payload, [key]: parseInt(e.target.value) || 0 })} className={fieldCls} />
+                      </div>
+                    );
+                    return (
                     <div className="space-y-6">
+                      <div className="grid grid-cols-3 gap-4">
+                        {numField('Ano Atual', 'currentYear', new Date().getFullYear())}
+                        {numField('Meta Core (Prog+Trigger+Adsmax)', 'metaCoreGoal', 150)}
+                        {numField('Meta Pixel', 'metaPixelGoal', 500)}
+                      </div>
+
+                      {/* BU Core */}
+                      <div className="bg-adsplay/5 border border-adsplay/15 rounded-2xl p-4 space-y-3">
+                        <p className="text-xs font-black text-adsplay uppercase tracking-[0.2em]">BU Core</p>
+                        <div className="grid grid-cols-1 gap-4">
+                          {numField('Programática', 'adsplay', 0)}
+                        </div>
+                      </div>
+
+                      {/* BU New */}
+                      <div className="bg-purple-500/5 border border-purple-500/15 rounded-2xl p-4 space-y-3">
+                        <p className="text-xs font-black text-purple-500 uppercase tracking-[0.2em]">BU New</p>
+                        <div className="grid grid-cols-3 gap-4">
+                          {numField('Trigger', 'trigger', 0)}
+                          {numField('Adsmax', 'adsmax', 0)}
+                          {numField('Pixel', 'pixel', 0)}
+                        </div>
+                      </div>
+
+                      <p className="text-[10px] text-zinc-400 font-medium">A variação % (vs. última atualização) é registrada automaticamente ao salvar. "Programática" corresponde ao antigo "Adsplay".</p>
+                    </div>
+                    );
+                  })()}
+
+                  {type === 'FINAL_SPRINT' && (
+                    <div className="space-y-6">
+                      <div className="flex items-center gap-3 p-4 bg-violet-50 rounded-2xl border border-violet-100">
+                        <span className="text-3xl">🦙</span>
+                        <div>
+                          <p className="text-xs font-black text-violet-700 uppercase tracking-widest">Sprint Final</p>
+                          <p className="text-[10px] text-violet-500 font-medium">Exibe o número que falta para bater a meta do mês. Vai dar gás no time!</p>
+                        </div>
+                      </div>
+
                       <div className="grid grid-cols-2 gap-4">
                         <div className="space-y-1.5">
-                          <label className="text-xs font-bold text-zinc-500 uppercase tracking-widest">Meta do Ano Atual</label>
-                          <input 
+                          <label className="text-xs font-bold text-zinc-500 uppercase tracking-widest">Meta (total)</label>
+                          <input
                             required
-                            type="number" 
-                            value={Number(payload.currentYearGoal) || 200}
-                            onChange={(e) => setPayload({ ...payload, currentYearGoal: parseInt(e.target.value) || 0 })}
+                            type="number"
+                            placeholder="Ex: 100"
+                            value={payload.target || ''}
+                            onChange={(e) => setPayload({ ...payload, target: parseInt(e.target.value) || 0 })}
                             className="w-full px-4 py-3 bg-zinc-50 border border-zinc-200 rounded-2xl focus:outline-none focus:ring-2 focus:ring-zinc-900/10 transition-all font-bold"
                           />
                         </div>
                         <div className="space-y-1.5">
-                          <label className="text-xs font-bold text-zinc-500 uppercase tracking-widest">Ano Atual</label>
-                          <input 
+                          <label className="text-xs font-bold text-zinc-500 uppercase tracking-widest">Realizadas (atual)</label>
+                          <input
                             required
-                            type="number" 
-                            value={Number(payload.currentYear) || new Date().getFullYear()}
-                            onChange={(e) => setPayload({ ...payload, currentYear: parseInt(e.target.value) || 0 })}
+                            type="number"
+                            placeholder="Ex: 65"
+                            value={payload.current || ''}
+                            onChange={(e) => setPayload({ ...payload, current: parseInt(e.target.value) || 0 })}
                             className="w-full px-4 py-3 bg-zinc-50 border border-zinc-200 rounded-2xl focus:outline-none focus:ring-2 focus:ring-zinc-900/10 transition-all font-bold"
                           />
                         </div>
@@ -1516,77 +1872,293 @@ export function Media() {
 
                       <div className="grid grid-cols-2 gap-4">
                         <div className="space-y-1.5">
-                          <label className="text-xs font-bold text-zinc-500 uppercase tracking-widest">Meta North Star (Total)</label>
-                          <input 
-                            required
-                            type="number" 
-                            value={Number(payload.targetGoal) || 1000}
-                            onChange={(e) => setPayload({ ...payload, targetGoal: parseInt(e.target.value) || 0 })}
-                            className="w-full px-4 py-3 bg-zinc-50 border border-zinc-200 rounded-2xl focus:outline-none focus:ring-2 focus:ring-zinc-900/10 transition-all font-bold"
+                          <label className="text-xs font-bold text-zinc-500 uppercase tracking-widest">Tipo da Métrica</label>
+                          <input
+                            type="text"
+                            placeholder="vendas, contratos, ativações..."
+                            value={payload.label || ''}
+                            onChange={(e) => setPayload({ ...payload, label: e.target.value })}
+                            className="w-full px-4 py-3 bg-zinc-50 border border-zinc-200 rounded-2xl focus:outline-none focus:ring-2 focus:ring-zinc-900/10 transition-all"
                           />
                         </div>
                         <div className="space-y-1.5">
-                          <label className="text-xs font-bold text-zinc-500 uppercase tracking-widest">Ano Limite</label>
-                          <input 
-                            required
-                            type="number" 
-                            value={Number(payload.targetYear) || 2030}
-                            onChange={(e) => setPayload({ ...payload, targetYear: parseInt(e.target.value) || 0 })}
-                            className="w-full px-4 py-3 bg-zinc-50 border border-zinc-200 rounded-2xl focus:outline-none focus:ring-2 focus:ring-zinc-900/10 transition-all font-bold"
+                          <label className="text-xs font-bold text-zinc-500 uppercase tracking-widest">Mês de Referência</label>
+                          <input
+                            type="text"
+                            placeholder="Ex: Maio, Junho"
+                            value={payload.month || ''}
+                            onChange={(e) => setPayload({ ...payload, month: e.target.value })}
+                            className="w-full px-4 py-3 bg-zinc-50 border border-zinc-200 rounded-2xl focus:outline-none focus:ring-2 focus:ring-zinc-900/10 transition-all"
                           />
                         </div>
                       </div>
 
-                      <div className="grid grid-cols-4 gap-4">
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-bold text-zinc-500 uppercase tracking-widest">Adsplay</label>
-                          <input 
-                            required
-                            type="number" 
-                            value={Number(payload.adsplay) || 0}
-                            onChange={(e) => setPayload({ ...payload, adsplay: parseInt(e.target.value) || 0 })}
-                            className="w-full px-4 py-3 bg-zinc-50 border border-zinc-200 rounded-2xl focus:outline-none focus:ring-2 focus:ring-zinc-900/10 transition-all font-bold"
-                          />
+                      <div className="space-y-1.5">
+                        <label className="text-xs font-bold text-zinc-500 uppercase tracking-widest">Nome do Time (opcional)</label>
+                        <input
+                          type="text"
+                          placeholder="Ex: Time Comercial, Squad Alpha"
+                          value={payload.teamName || ''}
+                          onChange={(e) => setPayload({ ...payload, teamName: e.target.value })}
+                          className="w-full px-4 py-3 bg-zinc-50 border border-zinc-200 rounded-2xl focus:outline-none focus:ring-2 focus:ring-zinc-900/10 transition-all"
+                        />
+                      </div>
+
+                      {(payload.target > 0) && (
+                        <div className="bg-zinc-900 p-5 rounded-3xl space-y-3">
+                          {(() => {
+                            const fmt = (n: number) => `R$ ${n.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+                            const remaining = Math.max(0, (payload.target || 100) - (payload.current || 0));
+                            const pct = Math.round(((payload.current || 0) / (payload.target || 1)) * 100);
+                            return (
+                              <>
+                                <div className="flex justify-between items-center">
+                                  <p className="text-[10px] font-black text-zinc-500 uppercase tracking-widest">Preview</p>
+                                  <p className="text-sm font-black text-adsplay">{fmt(remaining)} faltam</p>
+                                </div>
+                                <div className="space-y-1.5">
+                                  <div className="h-3 bg-zinc-800 rounded-full overflow-hidden">
+                                    <div
+                                      className="h-full bg-gradient-to-r from-adsplay to-violet-400 rounded-full transition-all duration-500"
+                                      style={{ width: `${Math.min(100, pct)}%` }}
+                                    />
+                                  </div>
+                                  <div className="flex justify-between text-[9px] font-bold text-zinc-600 uppercase tracking-widest">
+                                    <span>R$ 0,00</span>
+                                    <span className="text-zinc-400">{pct}% atingido</span>
+                                    <span className="text-adsplay">{fmt(payload.target || 0)} {payload.label || 'vendas'}</span>
+                                  </div>
+                                </div>
+                              </>
+                            );
+                          })()}
                         </div>
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-bold text-zinc-500 uppercase tracking-widest">Pixel</label>
-                          <input 
-                            required
-                            type="number" 
-                            value={Number(payload.pixel) || 0}
-                            onChange={(e) => setPayload({ ...payload, pixel: parseInt(e.target.value) || 0 })}
-                            className="w-full px-4 py-3 bg-zinc-50 border border-zinc-200 rounded-2xl focus:outline-none focus:ring-2 focus:ring-zinc-900/10 transition-all font-bold"
-                          />
+                      )}
+                    </div>
+                  )}
+
+                  {type === 'SMART_SALES' && (
+                    <div className="space-y-6">
+                      <div className="flex items-center gap-3 p-4 bg-emerald-50 rounded-2xl border border-emerald-100">
+                        <Trophy size={28} className="text-emerald-600 shrink-0" />
+                        <div>
+                          <p className="text-xs font-black text-emerald-700 uppercase tracking-widest">Smart Media · Vendas</p>
+                          <p className="text-[10px] text-emerald-600 font-medium">
+                            Conteúdo automático. Cada venda que chega em <span className="font-bold">entradadecampanha@adsplay.com.br</span> vira um card na TV em tempo real. Não é preciso cadastrar nada aqui — só configurar a exibição.
+                          </p>
                         </div>
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-bold text-zinc-500 uppercase tracking-widest">Trigger</label>
-                          <input 
-                            required
-                            type="number" 
-                            value={Number(payload.trigger) || 0}
-                            onChange={(e) => setPayload({ ...payload, trigger: parseInt(e.target.value) || 0 })}
-                            className="w-full px-4 py-3 bg-zinc-50 border border-zinc-200 rounded-2xl focus:outline-none focus:ring-2 focus:ring-zinc-900/10 transition-all font-bold"
-                          />
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <label className="text-xs font-bold text-zinc-500 uppercase tracking-widest">Exibição do valor (INVESTIMENTO)</label>
+                        <div className="grid grid-cols-3 gap-2">
+                          {([
+                            { v: 'full', label: 'Valor cheio', hint: 'R$ 80.000,00' },
+                            { v: 'abbreviated', label: 'Abreviado', hint: 'R$ 80 mil' },
+                            { v: 'hidden', label: 'Ocultar', hint: 'sem cifras' },
+                          ] as const).map((opt) => (
+                            <button
+                              key={opt.v}
+                              type="button"
+                              onClick={() => setPayload({ ...payload, valueDisplay: opt.v })}
+                              className={`p-3 rounded-2xl border-2 transition-all text-center ${
+                                (payload.valueDisplay || 'full') === opt.v
+                                  ? 'border-zinc-900 bg-zinc-900 text-white'
+                                  : 'border-zinc-100 text-zinc-500 hover:border-zinc-200'
+                              }`}
+                            >
+                              <p className="text-xs font-black uppercase tracking-widest">{opt.label}</p>
+                              <p className={`text-[9px] font-bold mt-0.5 ${(payload.valueDisplay || 'full') === opt.v ? 'text-zinc-400' : 'text-zinc-400'}`}>{opt.hint}</p>
+                            </button>
+                          ))}
                         </div>
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-bold text-zinc-500 uppercase tracking-widest">AdsMax</label>
-                          <input 
-                            required
-                            type="number" 
-                            value={Number(payload.adsmax) || 0}
-                            onChange={(e) => setPayload({ ...payload, adsmax: parseInt(e.target.value) || 0 })}
-                            className="w-full px-4 py-3 bg-zinc-50 border border-zinc-200 rounded-2xl focus:outline-none focus:ring-2 focus:ring-zinc-900/10 transition-all font-bold"
-                          />
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <label className="text-xs font-bold text-zinc-500 uppercase tracking-widest">Quais vendas exibir</label>
+                        <div className="grid grid-cols-2 gap-2">
+                          {([
+                            { v: 'latest', label: 'Últimas 5', hint: 'sempre, qualquer data' },
+                            { v: 'month', label: 'Mês atual', hint: 'zera a cada mês' },
+                          ] as const).map((opt) => (
+                            <button
+                              key={opt.v}
+                              type="button"
+                              onClick={() => setPayload({ ...payload, scope: opt.v })}
+                              className={`p-3 rounded-2xl border-2 transition-all text-center ${
+                                (payload.scope || 'latest') === opt.v
+                                  ? 'border-zinc-900 bg-zinc-900 text-white'
+                                  : 'border-zinc-100 text-zinc-500 hover:border-zinc-200'
+                              }`}
+                            >
+                              <p className="text-xs font-black uppercase tracking-widest">{opt.label}</p>
+                              <p className="text-[9px] font-bold text-zinc-400 mt-0.5">{opt.hint}</p>
+                            </button>
+                          ))}
                         </div>
+                      </div>
+
+                      <div className="flex items-center justify-between p-4 bg-zinc-50 rounded-2xl border border-zinc-100">
+                        <div>
+                          <p className="text-xs font-black text-zinc-700 uppercase tracking-widest">Comemorar venda nova</p>
+                          <p className="text-[10px] text-zinc-400 font-medium">Animação breve quando uma venda entra na tela.</p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setPayload({ ...payload, celebrate: payload.celebrate === false ? true : false })}
+                          className={`w-12 h-7 rounded-full transition-all relative ${payload.celebrate === false ? 'bg-zinc-300' : 'bg-emerald-500'}`}
+                        >
+                          <span className={`absolute top-1 w-5 h-5 bg-white rounded-full shadow transition-all ${payload.celebrate === false ? 'left-1' : 'left-6'}`} />
+                        </button>
                       </div>
                     </div>
                   )}
-                    
+
+                  {(type === 'WC_BRAZIL' || type === 'WC_TODAY' || type === 'WC_BRACKET') && (() => {
+                    const inputCls = "w-full px-3 py-2 bg-white border border-zinc-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-zinc-900/10 transition-all";
+                    const parseScore = (v: string) => (v === '' ? null : Number(v));
+                    const finishedCount = wcMatches.filter(m => m.status === 'finished').length;
+                    const pendingCount = wcMatches.length - finishedCount;
+                    return (
+                    <div className="space-y-6">
+                      <div className="bg-zinc-50 p-6 rounded-[2rem] border border-zinc-100 space-y-4">
+                        <div className="flex items-center gap-3">
+                          <div className="w-10 h-10 bg-adsplay/10 rounded-xl flex items-center justify-center text-adsplay">
+                            {getIcon(type)}
+                          </div>
+                          <div>
+                            <p className="text-xs font-black text-zinc-900 uppercase tracking-widest">Central de Resultados da Copa</p>
+                            <p className="text-[10px] text-zinc-400 font-medium">Base compartilhada pelos 3 cards. Jogo encerrado é fixo; a IA só atualiza os pendentes.</p>
+                          </div>
+                        </div>
+
+                        <div className="flex items-center justify-between p-3 bg-white rounded-2xl border border-zinc-100">
+                          <div>
+                            <p className="text-[11px] font-black text-zinc-700 uppercase tracking-widest">Atualização automática (pendentes)</p>
+                            <p className="text-[9px] text-zinc-400 font-medium">{payload.autoRefresh === false ? 'Travado — a TV não busca via IA.' : 'A TV atualiza placares de jogos pendentes via IA.'}</p>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => setPayload({ ...payload, autoRefresh: payload.autoRefresh === false ? true : false })}
+                            className={`w-12 h-7 rounded-full transition-all relative shrink-0 ${payload.autoRefresh === false ? 'bg-zinc-300' : 'bg-emerald-500'}`}
+                          >
+                            <span className={`absolute top-1 w-5 h-5 bg-white rounded-full shadow transition-all ${payload.autoRefresh === false ? 'left-1' : 'left-6'}`} />
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="space-y-2">
+                        <label className="text-xs font-bold text-zinc-500 uppercase tracking-widest">Importar base (colar JSON)</label>
+                        <textarea
+                          value={wcImportText}
+                          onChange={(e) => { setWcImportText(e.target.value); if (wcMsg) setWcMsg(null); }}
+                          placeholder={'Cole o JSON dos jogos aqui. Aceita { "copa_do_mundo": { "todos_os_jogos": [...] } } ou um array de jogos. Jogos encerrados viram base fixa.'}
+                          className="w-full h-40 px-3 py-2 bg-white border border-zinc-200 rounded-xl text-[11px] font-mono focus:outline-none focus:ring-2 focus:ring-zinc-900/10 transition-all resize-y"
+                        />
+                        <div className="flex flex-wrap gap-2">
+                          <button type="button" disabled={!!wcBusy || !wcImportText.trim()} onClick={importWcBase} className="px-4 py-2 bg-zinc-900 text-white rounded-xl font-black text-[10px] uppercase tracking-widest hover:bg-zinc-800 transition-all disabled:opacity-50 flex items-center gap-2">
+                            {wcBusy === 'import' && <Loader2 className="animate-spin" size={12} />}
+                            {wcBusy === 'import' ? 'Importando...' : 'Importar / atualizar base'}
+                          </button>
+                          <button type="button" disabled={!!wcBusy} onClick={syncWcPending} className="px-4 py-2 bg-adsplay text-white rounded-xl font-black text-[10px] uppercase tracking-widest hover:bg-adsplay-dark transition-all disabled:opacity-50 flex items-center gap-2 shadow-lg shadow-adsplay/20">
+                            {wcBusy === 'sync' ? <Loader2 className="animate-spin" size={12} /> : <TrendingUp size={12} />}
+                            {wcBusy === 'sync' ? 'Buscando...' : 'Sincronizar pendentes (IA)'}
+                          </button>
+                          <button type="button" disabled={!!wcBusy} onClick={syncBrazil} className="px-4 py-2 bg-emerald-600 text-white rounded-xl font-black text-[10px] uppercase tracking-widest hover:bg-emerald-700 transition-all disabled:opacity-50 flex items-center gap-2 shadow-lg shadow-emerald-900/20">
+                            {wcBusy === 'brazil' ? <Loader2 className="animate-spin" size={12} /> : <span>🇧🇷</span>}
+                            {wcBusy === 'brazil' ? 'Buscando...' : 'Sincronizar Brasil (IA)'}
+                          </button>
+                          <button type="button" disabled={!!wcBusy} onClick={loadWcMatches} className="px-4 py-2 bg-white border border-zinc-200 text-zinc-600 rounded-xl font-black text-[10px] uppercase tracking-widest hover:bg-zinc-50 transition-all disabled:opacity-50">
+                            {wcBusy === 'load' ? 'Carregando...' : 'Recarregar'}
+                          </button>
+                          <button type="button" disabled={!!wcBusy} onClick={clearWcBase} className="px-4 py-2 bg-white border border-rose-200 text-rose-600 rounded-xl font-black text-[10px] uppercase tracking-widest hover:bg-rose-50 transition-all disabled:opacity-50 flex items-center gap-2">
+                            <Trash2 size={12} /> {wcBusy === 'clear' ? 'Limpando...' : 'Limpar base'}
+                          </button>
+                        </div>
+
+                        {wcMsg && (
+                          <div className={`px-4 py-3 rounded-2xl text-xs font-bold border ${wcMsg.ok ? 'bg-emerald-50 border-emerald-200 text-emerald-700' : 'bg-rose-50 border-rose-200 text-rose-700'}`}>
+                            {wcMsg.text}
+                          </div>
+                        )}
+
+                        <p className="text-[9px] text-zinc-400 font-black uppercase tracking-widest">
+                          {wcMatches.length} jogos · {finishedCount} encerrados · {pendingCount} pendentes
+                        </p>
+                      </div>
+
+                      <div className="space-y-2 max-h-[42vh] overflow-y-auto pr-1">
+                        {wcMatches.length === 0 && (
+                          <p className="text-center text-zinc-400 text-sm py-6">Nenhum jogo ainda. Importe a base acima.</p>
+                        )}
+                        {wcMatches.map(m => (
+                          <div key={m.id} className={`p-3 rounded-2xl border relative ${m.status === 'finished' ? 'bg-emerald-50/40 border-emerald-100' : 'bg-zinc-50 border-zinc-100'}`}>
+                            <button type="button" onClick={() => deleteWcRow(m.id!)} className="absolute top-2 right-2 text-rose-500 hover:bg-rose-50 p-1 rounded-lg"><Trash2 size={12} /></button>
+                            <div className="grid grid-cols-2 gap-2 pr-6">
+                              <input className={inputCls} placeholder="Data (AAAA-MM-DD)" value={m.date || ''} onChange={e => updateWcRow(m.id!, { date: e.target.value })} />
+                              <input className={inputCls} placeholder="Fase" value={m.stage || ''} onChange={e => updateWcRow(m.id!, { stage: e.target.value })} />
+                              <input className={inputCls} placeholder="Mandante" value={m.home || ''} onChange={e => updateWcRow(m.id!, { home: e.target.value })} />
+                              <input className={inputCls} placeholder="País mand. (br)" value={m.homeCode || ''} onChange={e => updateWcRow(m.id!, { homeCode: e.target.value })} />
+                              <input className={inputCls} placeholder="Visitante" value={m.away || ''} onChange={e => updateWcRow(m.id!, { away: e.target.value })} />
+                              <input className={inputCls} placeholder="País vis. (jp)" value={m.awayCode || ''} onChange={e => updateWcRow(m.id!, { awayCode: e.target.value })} />
+                              <div className="flex gap-2">
+                                <input type="number" className={inputCls} placeholder="Gols M" value={m.homeScore ?? ''} onChange={e => updateWcRow(m.id!, { homeScore: parseScore(e.target.value) })} />
+                                <input type="number" className={inputCls} placeholder="Gols V" value={m.awayScore ?? ''} onChange={e => updateWcRow(m.id!, { awayScore: parseScore(e.target.value) })} />
+                              </div>
+                              <div className="flex gap-2">
+                                <input type="number" className={inputCls} placeholder="Pên M" value={m.homePens ?? ''} onChange={e => updateWcRow(m.id!, { homePens: parseScore(e.target.value) })} />
+                                <input type="number" className={inputCls} placeholder="Pên V" value={m.awayPens ?? ''} onChange={e => updateWcRow(m.id!, { awayPens: parseScore(e.target.value) })} />
+                              </div>
+                              <input className={inputCls} placeholder="Hora (HH:MM)" value={m.time || ''} onChange={e => updateWcRow(m.id!, { time: e.target.value })} />
+                              <select className={inputCls} value={m.status || 'scheduled'} onChange={e => updateWcRow(m.id!, { status: e.target.value as any })}>
+                                <option value="scheduled">A começar</option>
+                                <option value="live">Ao vivo</option>
+                                <option value="finished">Encerrado</option>
+                              </select>
+                            </div>
+                            <button type="button" disabled={!!wcBusy} onClick={() => saveWcRow(m)} className="mt-2 text-[10px] font-black text-adsplay uppercase tracking-widest disabled:opacity-50">Salvar este jogo</button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                    );
+                  })()}
+
+                  {type === 'WC_RANKING' && (() => {
+                    const inputCls = "w-full px-3 py-2 bg-white border border-zinc-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-zinc-900/10 transition-all";
+                    const list = payload.ranking || [];
+                    const set = (l: any[]) => setPayload({ ...payload, ranking: l });
+                    return (
+                      <div className="space-y-4">
+                        <div className="flex items-center gap-3 p-4 bg-yellow-50 rounded-2xl border border-yellow-100">
+                          <Star size={26} className="text-yellow-500 shrink-0" />
+                          <div>
+                            <p className="text-xs font-black text-yellow-700 uppercase tracking-widest">Ranking por Títulos</p>
+                            <p className="text-[10px] text-yellow-600 font-medium">Seleções ordenadas por número de Copas (estrelas). Edite quando mudar.</p>
+                          </div>
+                        </div>
+                        <div className="space-y-2">
+                          {list.map((r: any, i: number) => (
+                            <div key={i} className="bg-zinc-50 p-3 rounded-2xl border border-zinc-100 grid grid-cols-[1fr_auto_auto_auto] gap-2 items-center">
+                              <input className={inputCls} placeholder="Seleção" value={r.team || ''} onChange={e => { const l = [...list]; l[i] = { ...l[i], team: e.target.value }; set(l); }} />
+                              <input className={inputCls + ' w-24'} placeholder="País (br)" value={r.code || ''} onChange={e => { const l = [...list]; l[i] = { ...l[i], code: e.target.value }; set(l); }} />
+                              <input type="number" className={inputCls + ' w-20'} placeholder="Títulos" value={r.titles ?? ''} onChange={e => { const l = [...list]; l[i] = { ...l[i], titles: parseInt(e.target.value) || 0 }; set(l); }} />
+                              <button type="button" onClick={() => set(list.filter((_: any, j: number) => j !== i))} className="text-rose-500 hover:bg-rose-50 p-2 rounded-lg"><Trash2 size={14} /></button>
+                            </div>
+                          ))}
+                          <button type="button" onClick={() => set([...list, { team: '', code: '', titles: 1 }])} className="w-full py-3 border-2 border-dashed border-zinc-100 rounded-2xl flex items-center justify-center gap-2 text-zinc-400 hover:bg-zinc-50 transition-all">
+                            <Plus size={14} /><span className="text-[10px] font-black uppercase tracking-widest">Adicionar Seleção</span>
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })()}
+
                   </div>
                 </div>
-                
+
                 <div className="p-8 pt-4 border-t border-zinc-100 flex gap-3 shrink-0">
-                  <button 
+                  <button
                     type="button"
                     onClick={() => setIsModalOpen(false)}
                     className="flex-1 px-4 py-3 rounded-2xl font-bold text-zinc-500 hover:bg-zinc-100 transition-colors"

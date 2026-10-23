@@ -372,7 +372,7 @@ export function Backup() {
             Backup e Sincronização
           </h1>
           <p className="text-zinc-500 font-medium">
-            Exporte suas mídias e outros dados
+            Exporte as mídias, playlists e programação para sincronizar com a V2 ou criar salvaguardas de segurança.
           </p>
         </div>
       </header>
